@@ -111,4 +111,4 @@ alias kc="kubectl"
 alias vim=nvim
 
 alias gp="source ~/global_venv/bin/activate"
-
+alias ls="ls -a"
