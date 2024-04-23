@@ -1,6 +1,13 @@
 # $HOME/.config/alacritty/alacritty.toml
 # by Rito Ghosh 2023-10-06
 
+
+
+import = [
+    "~/.config/alacritty/themes/themes/nord.toml"
+]
+
+
 [window]
 
 opacity = 0.9
@@ -9,7 +16,10 @@ padding.x = 10
 padding.y = 10
 
 decorations = "Full"
-decorations_theme_variant = "Light" # "Dark"
+decorations_theme_variant = "Dark" # "Dark"
+
+
+
 
 [font]
 
@@ -19,3 +29,4 @@ italic.family = "Hack"
 bold_italic.family = "Hack"
 
 size = 13.0
+
