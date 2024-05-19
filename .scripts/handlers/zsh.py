@@ -21,7 +21,7 @@ class ZshHandler(Handler):
         logger.info(f"[zsh] installing zsh for {plt}:{distro}")
         if plt == "linux":
             if distro == "openSUSE Tumbleweed":
-                pass
+                self.run_shell_cmd("sudo zypper --non-interactive install zsh")
             elif distro == "Debian GNU/Linux":
                 self.run_shell_cmd("sudo apt-get -y install zsh")
                 
