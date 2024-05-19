@@ -58,6 +58,6 @@ class ZshHandler(Handler):
         
         logger.info("[zsh][oh-my-zsh][theme] installing spaceship theme soft link")
         self.run_shell_cmd(f"""
-                           ln -s "~/.oh-my-zsh/themes/spaceship-prompt/spaceship.zsh-theme" "{home_dir}/.oh-my-zsh/custom/themes/spaceship.zsh-theme"
+                           ln -s "{home_dir}/.oh-my-zsh/themes/spaceship-prompt/spaceship.zsh-theme" "{home_dir}/.oh-my-zsh/custom/themes/spaceship.zsh-theme"
                            """)
         
