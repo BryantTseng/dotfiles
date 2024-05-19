@@ -2,6 +2,7 @@ import sys
 from loguru import logger
 from handlers.handler import Handler
 import distro
+import os
 
 
 class PlatformHandler(Handler):
@@ -20,3 +21,7 @@ class PlatformHandler(Handler):
 
     def get_current_distro(self) -> str:
         return self.current_distro
+    def check_directory_or_file_exist(self, path)->bool:
+        if os.path.exists(path):
+            return True
+        return False

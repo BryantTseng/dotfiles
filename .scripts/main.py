@@ -3,7 +3,7 @@ from loguru import logger
 
 from handlers.zsh import ZshHandler
 from handlers.platform import PlatformHandler
-
+import shutil
 
 @click.group()
 def cli():
@@ -28,13 +28,20 @@ def zsh():
         )
         exit(1)
 
+            
+
     if zsh.shell_is_zsh():
         logger.info("shell is zsh already, skip zsh installation...")
     else:
         logger.info("installing zsh...")
         zsh.install_zsh(platform.get_current_platform(), platform.get_current_distro())
 
-
+    if platform.check_directory_or_file_exist("~/.oh-my-zsh"):
+        if click.confirm("~/.oh-my-zsh directory already exist, delete the directory?", default=True):
+            shutil.rmtree("~/.oh-my-zsh")
+            logger.info("installing oh-my-zsh...")
+            zsh.install_oh_my_zsh()
+            
 cli.add_command(zsh)
 
 cli()

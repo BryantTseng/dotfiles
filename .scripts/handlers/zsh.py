@@ -1,6 +1,7 @@
 import os
 from loguru import logger
 from handlers.handler import Handler
+import click
 import subprocess
 
 class ZshHandler(Handler):
@@ -25,11 +26,14 @@ class ZshHandler(Handler):
                 pass
             elif distro == "Debian GNU/Linux":
                 self.run_shell_cmd("sudo apt-get -y install zsh")
-                pass
+                
 
 
 
     def install_oh_my_zsh(self):
+        self.run_shell_cmd("""
+                            sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+                           """)
         return
 
     def install_oh_my_zsh_plugin(self):
