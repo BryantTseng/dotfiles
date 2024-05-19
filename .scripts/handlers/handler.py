@@ -22,7 +22,7 @@ class Handler:
         return True
     def run_shell_cmd(self, cmd):
         p = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE)
-        for line in iter(p.stdout.readline, b''):
+        for line in iter(p.stderr.readline, b''):
             print(line)
         p.stdout.close()
         p.wait()
