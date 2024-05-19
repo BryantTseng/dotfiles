@@ -18,7 +18,7 @@ class ZshHandler(Handler):
         else:
             return False
 
-    def install_zsh(self, plt, distro):
+    def install_zsh(self, plt:str, distro:str):
         logger.info(f"installing zsh for {plt}:{distro}")
         if plt == "linux":
             if distro == "openSUSE Tumbleweed":
