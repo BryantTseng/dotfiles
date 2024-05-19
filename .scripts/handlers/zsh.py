@@ -24,7 +24,7 @@ class ZshHandler(Handler):
             if distro == "openSUSE Tumbleweed":
                 pass
             elif distro == "Debian GNU/Linux":
-                self.run_shell_cmd("sudo apt-get install zsh")
+                self.run_shell_cmd("sudo apt-get -y install zsh")
                 pass
 
 
