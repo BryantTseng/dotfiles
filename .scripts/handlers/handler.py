@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from loguru import logger
 
 class Handler:
     supported_platform: list[str]
@@ -24,6 +25,6 @@ class Handler:
         p = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE)
         
         for line in iter(p.stderr.readline, b''):
-            print(line)
+            logger.info(f"{line}")
         p.stderr.close()
         p.wait()
