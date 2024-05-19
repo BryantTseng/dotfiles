@@ -28,35 +28,35 @@ class ZshHandler(Handler):
 
 
 
-    def install_oh_my_zsh(self):
+    def install_oh_my_zsh(self,home_dir:str):
         logger.info("[zsh][oh-my-zsh] installing zsh-syntax-highlighting")
         self.run_shell_cmd("""
                             sh -c "$(wget https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh -O -)"
                            """)
         return
 
-    def install_oh_my_zsh_plugin(self):
+    def install_oh_my_zsh_plugin(self,home_dir:str):
         # zsh-syntax-highlighting
         logger.info("[zsh][oh-my-zsh][plugin] installing zsh-syntax-highlighting")
-        self.run_shell_cmd("""
-                           git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ~/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting
+        self.run_shell_cmd(f"""
+                           git clone https://github.com/zsh-users/zsh-syntax-highlighting.git {home_dir}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting
                            """)
         # zsh-autosuggestions
         logger.info("[zsh][oh-my-zsh][plugin] installing zsh-syntax-autosuggestions")
-        self.run_shell_cmd("""
-                           git clone https://github.com/zsh-users/zsh-autosuggestions ~/.oh-my-zsh/custom/plugins/zsh-autosuggestions
+        self.run_shell_cmd(f"""
+                           git clone https://github.com/zsh-users/zsh-autosuggestions {home_dir}/.oh-my-zsh/custom/plugins/zsh-autosuggestions
                            """)
         
 
-    def install_oh_my_zsh_theme(self):
+    def install_oh_my_zsh_theme(self,home_dir:str):
         # spaceship
         logger.info("[zsh][oh-my-zsh][theme] installing spaceship theme")
-        self.run_shell_cmd("""
-                           git clone https://github.com/spaceship-prompt/spaceship-prompt.git "~/.oh-my-zsh/custom/themes/spaceship-prompt" --depth=1
+        self.run_shell_cmd(f"""
+                           git clone https://github.com/spaceship-prompt/spaceship-prompt.git "{home_dir}/.oh-my-zsh/custom/themes/spaceship-prompt" --depth=1
                            """)
+        
         logger.info("[zsh][oh-my-zsh][theme] installing spaceship theme soft link")
-     
-        self.run_shell_cmd("""
-                           ln -s "~/.oh-my-zsh/themes/spaceship-prompt/spaceship.zsh-theme" "~/.oh-my-zsh/custom/themes/spaceship.zsh-theme"
+        self.run_shell_cmd(f"""
+                           ln -s "~/.oh-my-zsh/themes/spaceship-prompt/spaceship.zsh-theme" "{home_dir}/.oh-my-zsh/custom/themes/spaceship.zsh-theme"
                            """)
         

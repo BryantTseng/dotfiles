@@ -1,6 +1,6 @@
 import click
 from loguru import logger
-
+import os
 from handlers.zsh import ZshHandler
 from handlers.platform import PlatformHandler
 import shutil
@@ -37,17 +37,18 @@ def zsh():
         zsh.install_zsh(platform.get_current_platform(), platform.get_current_distro())
 
     skip_oh_my_zsh=False
-    if platform.check_directory_or_file_exist("~/.oh-my-zsh"):
-        if click.confirm("~/.oh-my-zsh directory already exist, delete the directory?", default=True):
-            shutil.rmtree("~/.oh-my-zsh")
+    
+    if platform.check_directory_or_file_exist(f"{platform.get_home_dir()}/.oh-my-zsh"):
+        if click.confirm("$HOME/.oh-my-zsh directory already exist, delete the directory?", default=True):
+            shutil.rmtree(F"{platform.get_home_dir()}/.oh-my-zsh")
         else:
-            logger.info("skip oh-my-zsh installation since ~/.oh-my-zsh is existed...")
+            logger.info("skip oh-my-zsh installation since $HOME/.oh-my-zsh is existed...")
             skip_oh_my_zsh=True
     if not skip_oh_my_zsh:
         logger.info("installing oh-my-zsh...")
-        zsh.install_oh_my_zsh()
-        zsh.install_oh_my_zsh_plugin()
-        zsh.install_oh_my_zsh_theme()
+        zsh.install_oh_my_zsh(home_dir)
+        zsh.install_oh_my_zsh_plugin(home_dir)
+        zsh.install_oh_my_zsh_theme(home_dir)
 cli.add_command(zsh)
 
 cli()
