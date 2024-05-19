@@ -31,7 +31,8 @@ class ZshHandler(Handler):
     def install_oh_my_zsh(self,home_dir:str):
         logger.info("[zsh][oh-my-zsh] installing zsh-syntax-highlighting")
         self.run_shell_cmd("""
-                            sh -c "$(wget https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh -O -)" --RUNZSH=no
+                           export RUNZSH=no &&
+                            sh -c "$(wget https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh -O -)" 
                            """)
         return
 
