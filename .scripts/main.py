@@ -37,8 +37,8 @@ def zsh():
         zsh.install_zsh(platform.get_current_platform(), platform.get_current_distro())
 
     skip_oh_my_zsh=False
-    
-    if platform.check_directory_or_file_exist(f"{platform.get_home_dir()}/.oh-my-zsh"):
+    home_dir = platform.get_home_dir()
+    if platform.check_directory_or_file_exist(f"{home_dir}/.oh-my-zsh"):
         if click.confirm("$HOME/.oh-my-zsh directory already exist, delete the directory?", default=True):
             shutil.rmtree(F"{platform.get_home_dir()}/.oh-my-zsh")
         else:
