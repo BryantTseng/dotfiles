@@ -32,7 +32,7 @@ def zsh():
         logger.info("shell is zsh already, skip zsh installation...")
     else:
         logger.info("installing zsh...")
-        zsh.install_zsh()
+        zsh.install_zsh(platform.get_current_platform, platform.get_current_distro)
 
 
 cli.add_command(zsh)
