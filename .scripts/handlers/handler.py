@@ -22,11 +22,7 @@ class Handler:
         return True
     def run_shell_cmd(self, cmd):
         p = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE)
-        ## But do not wait till netstat finish, start displaying output immediately ##
-        while True:
-            out = p.stderr.read(1)
-            if out == '' and p.poll() != None:
-                break
-            if out != '':
-                sys.stdout.write(out)
-                sys.stdout.flush()
+        for line in iter(p.stdout.readline, b''):
+            print(line)
+        p.stdout.close()
+        p.wait()
