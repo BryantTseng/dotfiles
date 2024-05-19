@@ -44,7 +44,10 @@ def zsh():
             logger.info("skip oh-my-zsh installation since ~/.oh-my-zsh is existed...")
             skip_oh_my_zsh=True
     if not skip_oh_my_zsh:
+        logger.info("installing oh-my-zsh...")
         zsh.install_oh_my_zsh()
+        zsh.install_oh_my_zsh_plugin()
+        zsh.install_oh_my_zsh_theme()
 cli.add_command(zsh)
 
 cli()
