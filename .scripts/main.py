@@ -36,12 +36,15 @@ def zsh():
         logger.info("installing zsh...")
         zsh.install_zsh(platform.get_current_platform(), platform.get_current_distro())
 
+    skip_oh_my_zsh=False
     if platform.check_directory_or_file_exist("~/.oh-my-zsh"):
         if click.confirm("~/.oh-my-zsh directory already exist, delete the directory?", default=True):
             shutil.rmtree("~/.oh-my-zsh")
-            logger.info("installing oh-my-zsh...")
-            zsh.install_oh_my_zsh()
-            
+        else:
+            logger.info("skip oh-my-zsh installation since ~/.oh-my-zsh is existed...")
+            skip_oh_my_zsh=True
+    if not skip_oh_my_zsh:
+        zsh.install_oh_my_zsh()
 cli.add_command(zsh)
 
 cli()
