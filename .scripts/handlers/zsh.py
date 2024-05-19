@@ -32,7 +32,7 @@ class ZshHandler(Handler):
 
     def install_oh_my_zsh(self):
         self.run_shell_cmd("""
-                            sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+                            sh -c "$(wget https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh -O -)"
                            """)
         return
 
