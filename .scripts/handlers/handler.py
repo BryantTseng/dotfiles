@@ -24,6 +24,6 @@ class Handler:
         p = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE)
         
         for line in iter(p.stderr.readline, b''):
-            logger.info(f"{line}")
+            print(f"{line}")
         p.stderr.close()
         p.wait()
