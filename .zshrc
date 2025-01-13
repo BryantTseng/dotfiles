@@ -139,13 +139,10 @@ SPACESHIP_PROMPT_ORDER=(
 SPACESHIP_PROMPT_ADD_NEWLINE=false
 SPACESHIP_DIR_TRUNC_REPO=false
 
-alias camera50="v4l2-ctl --set-ctrl=power_line_frequency=1 --device=/dev/video0"
+#alias camera50="v4l2-ctl --set-ctrl=power_line_frequency=1 --device=/dev/video0"
 alias kc="kubectl"
-alias vim=nvim
+#alias vim=nvim
 
-alias gp="source ~/global_venv/bin/activate"
+#alias gp="source ~/global_venv/bin/activate"
 alias ls="ls -A"
 
-### MANAGED BY RANCHER DESKTOP START (DO NOT EDIT)
-export PATH="/home/btsg/.rd/bin:$PATH"
-### MANAGED BY RANCHER DESKTOP END (DO NOT EDIT)
