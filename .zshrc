@@ -146,3 +146,28 @@ alias kc="kubectl"
 #alias gp="source ~/global_venv/bin/activate"
 alias ls="ls -A"
 
+# ------------------------------------------------------------------------------
+# RMUX & Command Completion Notifications
+# ------------------------------------------------------------------------------
+# Automatically emits a terminal bell (triggering an RMUX desktop notification
+# and status alert) whenever any command runs for more than 15 seconds.
+autoload -Uz add-zsh-hook
+__long_cmd_start=0
+__zsh_notify_preexec() {
+  __long_cmd_start=$SECONDS
+}
+__zsh_notify_precmd() {
+  if (( __long_cmd_start > 0 )); then
+    local elapsed=$(( SECONDS - __long_cmd_start ))
+    __long_cmd_start=0
+    if (( elapsed >= 15 )); then
+      printf '\a'
+    fi
+  fi
+}
+add-zsh-hook preexec __zsh_notify_preexec
+add-zsh-hook precmd __zsh_notify_precmd
+
+# Manual alert shortcut (e.g., agy -p "..." ; alert)
+alias alert="printf '\a'"
+
