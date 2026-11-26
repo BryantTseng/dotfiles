@@ -40,8 +40,11 @@ $KANBAN show <card_id>
 # Create a card (defaults to Backlog, does NOT trigger an agy run)
 $KANBAN create "Task title" --desc "Details..." --list "To-Do"
 
+# Create a repo-backed, plan-first card (git worktree of clerk, spec/Q&A before coding)
+$KANBAN create "Backtest feature" --desc "Details..." --list "To-Do" --repo clerk --plan-first
+
 # Create AND immediately start an agy run (ONLY when user explicitly asks!)
-$KANBAN create "Task title" --desc "Details..." --list "To-Do" --trigger
+$KANBAN create "Task title" --desc "Details..." --list "To-Do" --repo clerk --plan-first --trigger
 
 # Move a card between columns (e.g. drag to Auditing to trigger read-only audit)
 $KANBAN move <card_id> "Auditing"
@@ -79,10 +82,13 @@ $KANBAN delete <card_id>
 | 6 | Done | `1916814904141022224` | Closed list — finished runs land here directly (no auto-audit) |
 | 7 | Flagged | `1916814904208131089` | Auditor found problems (`audit:<flag>` labels) |
 
-## Paths, Service Management & Backups
+## Paths, Repo Worktrees, Service Management & Backups
 
 - **Source of truth:** `~/workspace/dotfiles/kanban-bridge/` (symlinked at `~/workspace/kanban-bridge`)
-- **Task repos:** `~/workspace/kanban-tasks/task-<id>-<slug>/` (one git repo per card, one commit per run)
+- **Task repos & worktrees:**
+  - Scratch cards: `~/workspace/kanban-tasks/task-<id>-<slug>/`
+  - Repo-backed cards (`repo:<name>` label or board matching `BRIDGE_REPOS`): isolated `git worktree` at `~/workspace/kanban-tasks/<repo>-task-<id>-<slug>/` on branch `kanban/<id-tail>-<slug>` with shared `CARGO_TARGET_DIR` (clean up after PR merge with `git -C ~/workspace/<repo> worktree remove <path>`).
+- **Plan-first workflow:** Attach `plan-first` to run spec/Q&A first without modifying production code; replying `do it` / `proceed` automatically removes `plan-first` and unlocks implementation.
 - **Host audit logs:** `~/.local/share/kanban-bridge/logs/<conversation-id>.jsonl`
 - **Service commands:**
   ```bash

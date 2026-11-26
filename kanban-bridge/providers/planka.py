@@ -27,7 +27,7 @@ from providers import BoardProvider, Comment, Label, Task, WebhookEvent
 
 log = logging.getLogger("bridge.planka")
 
-PLANKA_EVENTS = ["cardCreate", "cardUpdate", "cardLabelCreate", "commentCreate"]
+PLANKA_EVENTS = ["cardCreate", "cardUpdate", "cardLabelCreate", "cardLabelDelete", "commentCreate"]
 SESSION_TAG_RE = re.compile(r"\n*<!--\s*agy-session:([A-Za-z0-9._-]+)\s*-->\s*$")
 
 # Map bridge hex colors to Planka v2 Label.COLORS
@@ -37,6 +37,8 @@ HEX_TO_PLANKA_COLOR = {
     "7e57c2": "lilac-eyes",      # access:*
     "9e9e9e": "muddy-grey",      # session:* (if ever created as a label)
     "4f7cff": "lagoon-blue",     # agy trigger
+    "fbc02d": "egg-yellow",      # plan-first
+    "1e88e5": "antique-blue",    # repo:*
 }
 
 
@@ -140,6 +142,7 @@ class PlankaBoard(BoardProvider):
         board_labels_by_id: dict[str, dict],
         card_label_ids: list[str],
         lists_by_id: dict[str, dict],
+        board_name: str = "",
     ) -> Task:
         raw_desc = card.get("description") or ""
         labels: list[Label] = []
@@ -168,6 +171,7 @@ class PlankaBoard(BoardProvider):
             title=card.get("name") or "",
             description_text=desc_clean,
             project_id=str(card.get("boardId") or ""),
+            project_name=board_name,
             done=is_done,
             index=str(card["id"])[-4:],
             labels=labels,
@@ -188,14 +192,18 @@ class PlankaBoard(BoardProvider):
     # ---------- BoardProvider methods ----------
 
     def ensure_setup(self) -> None:
-        # 1. Ensure global Planka webhook pointing to our listener exists
+        # 1. Ensure global Planka webhook pointing to our listener exists with current events
         webhooks = (self._api("GET", "/webhooks") or {}).get("items") or []
+        desired_events = ",".join(PLANKA_EVENTS)
+        existing_hook = None
         for h in webhooks:
             url = h.get("url") or ""
-            if url.endswith("/planka") and ":8787/" in url and url != self.webhook_url:
+            if url == self.webhook_url:
+                existing_hook = h
+            elif url.endswith("/planka") and ":8787/" in url:
                 self._api("DELETE", f"/webhooks/{h['id']}")
                 log.info("removed old Planka webhook %s", url)
-        if not any(h.get("url") == self.webhook_url for h in webhooks):
+        if existing_hook is None:
             self._api(
                 "POST",
                 "/webhooks",
@@ -203,10 +211,13 @@ class PlankaBoard(BoardProvider):
                     "name": "kanban-bridge",
                     "url": self.webhook_url,
                     "accessToken": self.webhook_secret,
-                    "events": ",".join(PLANKA_EVENTS),
+                    "events": desired_events,
                 },
             )
             log.info("registered Planka webhook %s", self.webhook_url)
+        elif set(existing_hook.get("events") or []) != set(PLANKA_EVENTS):
+            self._api("PATCH", f"/webhooks/{existing_hook['id']}", {"events": desired_events})
+            log.info("updated Planka webhook events -> %s", desired_events)
 
         # 2. Ensure bot user has viewer+canComment membership on every board
         bot_uid = self._resolve_bot_user_id()
@@ -237,6 +248,7 @@ class PlankaBoard(BoardProvider):
         card = data["item"]
         board_id = str(card["boardId"])
         board = self._get_board_bundle(board_id)
+        board_name = (board.get("item") or {}).get("name") or ""
         inc = board.get("included") or {}
         labels_by_id = {str(l["id"]): l for l in (inc.get("labels") or [])}
         lists_by_id = {str(l["id"]): l for l in (inc.get("lists") or [])}
@@ -245,7 +257,7 @@ class PlankaBoard(BoardProvider):
             for cl in ((data.get("included") or {}).get("cardLabels") or [])
             if str(cl.get("cardId")) == str(card["id"])
         ]
-        return self._build_task(card, labels_by_id, card_label_ids, lists_by_id)
+        return self._build_task(card, labels_by_id, card_label_ids, lists_by_id, board_name=board_name)
 
     def list_triggered_tasks(self, trigger_label: str) -> list[Task]:
         out: list[Task] = []
@@ -253,6 +265,7 @@ class PlankaBoard(BoardProvider):
         boards = (proj_data.get("included") or {}).get("boards") or []
         for b in boards:
             bundle = self._get_board_bundle(str(b["id"]))
+            board_name = (bundle.get("item") or {}).get("name") or b.get("name") or ""
             inc = bundle.get("included") or {}
             labels_by_id = {str(l["id"]): l for l in (inc.get("labels") or [])}
             lists_by_id = {str(l["id"]): l for l in (inc.get("lists") or [])}
@@ -264,7 +277,7 @@ class PlankaBoard(BoardProvider):
                 if lst.get("type") in ("archive", "trash"):
                     continue
                 task = self._build_task(
-                    card, labels_by_id, cl_by_card.get(str(card["id"]), []), lists_by_id
+                    card, labels_by_id, cl_by_card.get(str(card["id"]), []), lists_by_id, board_name=board_name
                 )
                 if trigger_label in task.label_titles:
                     out.append(task)
@@ -434,7 +447,7 @@ class PlankaBoard(BoardProvider):
                 ),
                 doer_username=doer,
             )
-        if ev == "cardLabelCreate":
+        if ev in ("cardLabelCreate", "cardLabelDelete"):
             card_id = item.get("cardId")
             return WebhookEvent(event_type="task.updated", task_id=str(card_id), doer_username=doer) if card_id else None
         if ev == "cardCreate":

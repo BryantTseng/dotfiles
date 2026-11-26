@@ -11,8 +11,8 @@ Operational notes for AI agents (`agy`, `claudecode`, etc.) working in this repo
 ## Active Board (Planka v2)
 - **Board URL:** `http://localhost:3000/boards/1916814609835099142` (`Project: Agy`, `Board: Agy`)
 - **Lists:** Backlog (`1916814903729980427`), To-Do (`1916814903839032332`), Need Action (`1916814903922918413`), Doing (`1916814904006804494`), Auditing (`1916814904073913359`), Done (`1916814904141022224`, closed), Flagged (`1916814904208131089`)
-- **Trigger label `agy`:** `1916814904292017170`
-- **Audit trigger:** Audits run **only** when the user explicitly moves a card into **Auditing**. Finished runs (`STATUS: DONE`) move straight to **Done**.
+- **Labels:** `agy` (`1916814904292017170`), `plan-first` (spec/Q&A gate before coding), `repo:clerk` / `repo:dotfiles` (isolated `git worktree` + clean PR commits + shared `CARGO_TARGET_DIR`)
+- **Audit trigger:** Audits run **only** when the user explicitly moves a card into **Auditing** (diffs against `merge-base origin/main HEAD` for repo-backed cards). Finished runs (`STATUS: DONE`) move straight to **Done**.
 
 ## Architecture
 - `bridge.py`: Core orchestrator (queueing, 2-slot cap, git commits, access flow, notifications, graceful/forced shutdown, auto-reload via exit code `3`).

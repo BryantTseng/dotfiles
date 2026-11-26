@@ -123,13 +123,20 @@ for idx, (name, ltype) in enumerate(desired, start=1):
             "position": idx * 65536,
         }, api_key=admin_key)
 
-existing_labels = {l.get("name"): l for l in (inc.get("labels") or [])}
-if "agy" not in existing_labels:
-    api("POST", f"/boards/{bid}/labels", {
-        "name": "agy",
-        "color": "lagoon-blue",
-        "position": 65536,
-    }, api_key=admin_key)
+existing_labels = {l.get("name"): l for l in (inc.get("labels") or []) if l.get("name")}
+default_labels = [
+    ("agy", "lagoon-blue"),
+    ("plan-first", "egg-yellow"),
+    ("repo:clerk", "antique-blue"),
+    ("repo:dotfiles", "deep-ocean"),
+]
+for idx, (lname, lcolor) in enumerate(default_labels, start=1):
+    if lname not in existing_labels:
+        api("POST", f"/boards/{bid}/labels", {
+            "name": lname,
+            "color": lcolor,
+            "position": idx * 65536,
+        }, api_key=admin_key)
 
 # 5. Update ~/.config/kanban-bridge/env (preserving all existing bridge keys)
 lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []

@@ -83,12 +83,14 @@ class AgyAgent(AgentProvider):
         model: str | None = None,
         effort: str | None = None,
         auditor_model: str | None = None,
+        disable_slash_commands: bool = False,
         base_env: dict[str, str] | None = None,
     ):
         self.agy_bin = agy_bin
         self.model = model or None
         self.effort = effort or None
         self.auditor_model = auditor_model or model or None
+        self.disable_slash_commands = disable_slash_commands
         self.base_env = {
             k: v for k, v in (base_env or os.environ).items() if k not in BRIDGE_SECRET_KEYS
         }
@@ -101,6 +103,7 @@ class AgyAgent(AgentProvider):
             model=env.get("BRIDGE_AGY_MODEL"),
             effort=env.get("BRIDGE_AGY_EFFORT"),
             auditor_model=env.get("BRIDGE_AUDITOR_MODEL"),
+            disable_slash_commands=env.get("BRIDGE_AGY_DISABLE_SLASH_COMMANDS", "0") == "1",
             base_env=env,
         )
 
@@ -302,8 +305,9 @@ class AgyAgent(AgentProvider):
             "stream-json",
             "--sandbox",
             "--dangerously-skip-permissions",
-            "--disable-slash-commands",
         ]
+        if self.disable_slash_commands:
+            cmd.append("--disable-slash-commands")
         if resume and session_id:
             cmd += ["--conversation", session_id]
         if self.model:

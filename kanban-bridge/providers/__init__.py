@@ -40,6 +40,7 @@ class Task:
     title: str
     description_text: str = ""
     project_id: str = ""
+    project_name: str = ""
     done: bool = False
     index: str = ""
     labels: list[Label] = field(default_factory=list)

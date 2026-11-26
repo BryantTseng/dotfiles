@@ -222,16 +222,39 @@ def cmd_create(cli: PlankaClient, args) -> None:
     card = cli.req("POST", f"/lists/{lst['id']}/cards", payload)["item"]
     cid = str(card["id"])
 
-    if args.trigger:
-        lbl = next((l for l in (inc.get("labels") or []) if l.get("name") == cli.trigger_label), None)
+    existing_labels = {l.get("name"): l for l in (inc.get("labels") or []) if l.get("name")}
+    max_pos = max((l.get("position") or 0 for l in (inc.get("labels") or [])), default=0)
+
+    def ensure_and_attach(label_name: str, color: str):
+        nonlocal max_pos
+        lbl = existing_labels.get(label_name)
         if not lbl:
-            raise SystemExit(f"Trigger label {cli.trigger_label!r} not found on board {bid}")
+            max_pos += 65536
+            lbl = cli.req(
+                "POST",
+                f"/boards/{bid}/labels",
+                {"name": label_name, "color": color, "position": max_pos},
+            )["item"]
+            existing_labels[label_name] = lbl
         cli.req("POST", f"/cards/{cid}/card-labels", {"labelId": str(lbl["id"])})
+
+    attached = []
+    if args.repo:
+        repo_lbl = f"repo:{args.repo.strip().lower()}"
+        ensure_and_attach(repo_lbl, "antique-blue")
+        attached.append(repo_lbl)
+    if args.plan_first:
+        ensure_and_attach("plan-first", "egg-yellow")
+        attached.append("plan-first")
+    if args.trigger:
+        ensure_and_attach(cli.trigger_label, "lagoon-blue")
+        attached.append(cli.trigger_label)
 
     print(json.dumps({
         "id": cid,
         "name": card["name"],
         "list": lst["name"],
+        "labels": attached,
         "triggered": bool(args.trigger),
         "url": f"{cli.base_url}/cards/{cid}",
     }, indent=2))
@@ -340,6 +363,8 @@ def main() -> None:
     p_create.add_argument("title")
     p_create.add_argument("--desc", default="")
     p_create.add_argument("--list", default="Backlog")
+    p_create.add_argument("--repo", help="Attach repo:<name> label to run in a git worktree of that repo")
+    p_create.add_argument("--plan-first", action="store_true", help="Attach plan-first label (spec/Q&A before coding)")
     p_create.add_argument("--trigger", action="store_true", help="Attach 'agy' trigger label to start a run")
 
     p_move = sub.add_parser("move", help="Move a card to a column by name")

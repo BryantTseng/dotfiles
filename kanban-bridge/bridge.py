@@ -58,12 +58,41 @@ TASKS_ROOT = Path(ENV.get("BRIDGE_TASKS_ROOT", "~/workspace/kanban-tasks")).expa
 STATE_ROOT = Path(ENV.get("BRIDGE_STATE_ROOT", "~/.local/share/kanban-bridge")).expanduser()
 LOGS_DIR = STATE_ROOT / "logs"
 
-RUN_TIMEOUT = int(ENV.get("BRIDGE_RUN_TIMEOUT", "1800"))
+RUN_TIMEOUT = int(ENV.get("BRIDGE_RUN_TIMEOUT", "3600"))
 MAX_CONCURRENT = int(ENV.get("BRIDGE_MAX_CONCURRENT", "2"))
 
 TRIGGER_LABEL = ENV.get("BRIDGE_TRIGGER_LABEL", "agy")
+PLAN_FIRST_LABEL = ENV.get("BRIDGE_PLAN_FIRST_LABEL", "plan-first")
+REPO_LABEL_PREFIX = "repo:"
 SESSION_PREFIX = "session:"
 SESSION_COLOR = "9e9e9e"
+
+# Repo mapping for git-worktree-backed cards: e.g. "clerk=~/workspace/clerk,dotfiles=~/workspace/dotfiles"
+def _parse_repos(raw: str) -> dict[str, Path]:
+    out: dict[str, Path] = {}
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        name, path_str = entry.split("=", 1)
+        name = name.strip().lower()
+        if name:
+            out[name] = Path(path_str.strip()).expanduser().resolve()
+    return out
+
+
+REPOS: dict[str, Path] = _parse_repos(ENV.get("BRIDGE_REPOS", ""))
+SHARE_CARGO_TARGET = ENV.get("BRIDGE_SHARE_CARGO_TARGET", "1") == "1"
+_repo_locks: dict[str, threading.Lock] = {}
+_repo_locks_guard = threading.Lock()
+
+
+def _repo_lock(repo_name: str) -> threading.Lock:
+    with _repo_locks_guard:
+        if repo_name not in _repo_locks:
+            _repo_locks[repo_name] = threading.Lock()
+        return _repo_locks[repo_name]
+
 
 # Placeholder comments start with ⏳ so a restarted bridge can find interrupted ones.
 PH = "⏳"
@@ -73,6 +102,7 @@ PH_AUDIT = f"{PH} **🔍 Audit**: _reviewing…_"
 LEGACY_PLACEHOLDERS = ("Working on it…", "🔍 Audit: reviewing…")
 
 # Board column names (lower-cased)
+BUCKET_PLANNING = ENV.get("BRIDGE_PLANNING_BUCKET", "planning").strip().lower()
 BUCKET_DOING = "doing"
 BUCKET_NEEDS_ACTION = "need action"
 BUCKET_AUDITING = ENV.get("BRIDGE_AUDIT_BUCKET", "auditing").strip().lower()
@@ -153,16 +183,95 @@ def wants_audit(task: Task) -> bool:
     return BOARD.current_bucket(task) == BUCKET_AUDITING
 
 
-# ---------- task directory (git) ----------
+# ---------- task directory / repo worktree (git) ----------
 
 
-def task_dir(task: Task) -> Path:
-    slug = re.sub(r"[^a-z0-9]+", "-", task.title.lower()).strip("-")[:40] or "task"
+def _slug(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40] or "task"
+
+
+def resolve_repo(task: Task) -> tuple[str | None, Path | None]:
+    """Match a card to a configured local git repo via `repo:<name>` label or board name."""
+    for lbl in task.label_titles:
+        low = lbl.strip().lower()
+        if low.startswith(REPO_LABEL_PREFIX):
+            name = low[len(REPO_LABEL_PREFIX):].strip()
+            if name in REPOS:
+                return name, REPOS[name]
+            raise RuntimeError(
+                f"Card requests `repo:{name}`, which is not configured in BRIDGE_REPOS "
+                f"(available: {', '.join(sorted(REPOS)) or 'none'})."
+            )
+    board_key = (task.project_name or "").strip().lower()
+    if board_key and board_key in REPOS:
+        return board_key, REPOS[board_key]
+    return None, None
+
+
+def _default_base_ref(repo_path: Path) -> str:
+    for ref in ("origin/main", "origin/master", "main", "master"):
+        if git(repo_path, "rev-parse", "-q", "--verify", ref):
+            return ref
+    return "HEAD"
+
+
+def ensure_task_workspace(task: Task) -> tuple[Path, dict | None]:
+    """Return `(cwd, repo_ctx)`.
+
+    - For repo-backed cards (`repo:<name>` or board matching `BRIDGE_REPOS`), creates or reuses
+      an isolated `git worktree` on branch `kanban/<id-tail>-<slug>` off the repo's default branch.
+    - Otherwise creates or reuses a standalone scratch git repo in `TASKS_ROOT`.
+    """
+    slug = _slug(task.title)
+    repo_name, repo_path = resolve_repo(task)
+    if repo_name and repo_path:
+        if not (repo_path / ".git").exists():
+            raise RuntimeError(f"Configured repo `{repo_name}` is not a git repo: {repo_path}")
+        with _repo_lock(repo_name):
+            existing = sorted(TASKS_ROOT.glob(f"{repo_name}-task-{task.id}-*"))
+            if existing and (existing[0] / ".git").exists():
+                wt = existing[0]
+                branch = git(wt, "rev-parse", "--abbrev-ref", "HEAD") or f"kanban/{task.id[-6:]}-{slug}"
+                base_ref = _default_base_ref(repo_path)
+                return wt, {
+                    "name": repo_name,
+                    "repo_path": repo_path,
+                    "branch": branch,
+                    "base_ref": base_ref,
+                }
+
+            # Best-effort fetch so the new worktree branches off latest default branch
+            subprocess.run(
+                ["git", "-C", str(repo_path), "fetch", "--prune", "origin"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            base_ref = _default_base_ref(repo_path)
+            short_id = task.id[-6:] if len(task.id) > 6 else task.id
+            branch = f"kanban/{short_id}-{slug}"
+            wt = TASKS_ROOT / f"{repo_name}-task-{task.id}-{slug}"
+            # If the branch already exists (e.g. previous worktree pruned), attach to it; else create it
+            if git(repo_path, "rev-parse", "-q", "--verify", f"refs/heads/{branch}"):
+                cmd = ["git", "-C", str(repo_path), "worktree", "add", str(wt), branch]
+            else:
+                cmd = ["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(wt), base_ref]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RuntimeError(f"git worktree add failed: {res.stderr.strip() or res.stdout.strip()}")
+            log.info("task %s: created worktree %s on branch %s (base %s)", task.id, wt, branch, base_ref)
+            return wt, {
+                "name": repo_name,
+                "repo_path": repo_path,
+                "branch": branch,
+                "base_ref": base_ref,
+            }
+
     existing = sorted(TASKS_ROOT.glob(f"task-{task.id}-*"))
     d = existing[0] if existing else TASKS_ROOT / f"task-{task.id}-{slug}"
     d.mkdir(parents=True, exist_ok=True)
     ensure_repo(d)
-    return d
+    return d, None
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -202,29 +311,85 @@ def commit_run(cwd: Path, message: str) -> str | None:
 
 # ---------- prompt & status ----------
 
+PLAN_APPROVE_RE = re.compile(
+    r"^\s*(do it|proceed|go ahead|implement|start implementing|approved? to implement|lgtm\b.*implement)\b",
+    re.I,
+)
 
-def system_prompt(task: Task, granted: list[str], cwd: Path) -> str:
+
+def is_plan_first(task: Task) -> bool:
+    if any(l.strip().lower() == PLAN_FIRST_LABEL.lower() for l in task.label_titles):
+        return True
+    return BOARD.current_bucket(task) == BUCKET_PLANNING
+
+
+def system_prompt(
+    task: Task,
+    granted: list[str],
+    cwd: Path,
+    repo_ctx: dict | None = None,
+    plan_only: bool = False,
+) -> str:
     profiles = ", ".join(readonly_aws_profiles()) or "(none found)"
-    return (
-        f"You are working on kanban task #{task.id} through a bridge, running inside a sandbox. "
-        "The user talks to you only through task comments: your final message is posted as a "
-        "comment on the task, so write it for them in concise markdown (what you did, results, "
-        f"anything you need). Your working directory ({cwd}) is the task directory and the ONLY "
-        "place you may modify files. It is a git repository and the bridge commits your changes "
-        "after each run, so do NOT run git commit or rewrite git history yourself. You cannot "
-        "ask for anything interactively; if you are blocked or need a decision, say so in your "
-        "final message and stop.\n\n"
+    parts = [
+        f"You are working on kanban card #{task.id} through a headless bridge. "
+        "The user talks to you ONLY through card comments: your final message is posted as a "
+        "comment on the card, so write it in concise, clear markdown. "
+        "NEVER call interactive tools like `ask_question` or `ask_permission` (they cannot prompt "
+        "in headless mode); instead, put clear numbered questions directly in your markdown reply "
+        "and end with `STATUS: NEEDS_INPUT`."
+    ]
+
+    if repo_ctx:
+        parts.append(
+            f"You are working inside an isolated `git worktree` of repository `{repo_ctx['name']}` "
+            f"at `{cwd}` on feature branch `{repo_ctx['branch']}` (branched from `{repo_ctx['base_ref']}`). "
+            "ONLY modify files inside this worktree.\n"
+            "- Follow the repository's own `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` rules (including "
+            "multi-agent Dev Worker + Reviewer Gate workflows, linting, formatting, and test suites).\n"
+            "- Make clean, logical git commits directly on your feature branch (`" + repo_ctx["branch"] + "`). "
+            "NEVER commit to or push directly to `main` or `master`.\n"
+            "- You may use rootless Docker for ephemeral integration test containers (e.g. Postgres), "
+            "but you MUST stop and remove any ephemeral test containers before finishing.\n"
+            "- When ready to push or open a PR with `gh pr create`: if `gh` is not yet granted below, "
+            "finish your local commits and tests first, summarize results, and request `ACCESS_REQUEST: gh`.\n"
+            "- In your final implementation comment, include a crisp summary with: **Branch**, "
+            "**Tests** (exact commands + pass/fail counts), **PR URL** (if opened), and **Key Files / Spec**."
+        )
+    else:
+        parts.append(
+            f"Your working directory (`{cwd}`) is the standalone task directory and the ONLY place "
+            "you may modify files. It is a git repository and the bridge commits your changes after "
+            "each run, so do NOT run `git commit` or rewrite git history yourself."
+        )
+
+    if plan_only:
+        parts.append(
+            "**PLAN-FIRST / SPEC-ONLY MODE IS ACTIVE:**\n"
+            "- Do NOT modify production code yet.\n"
+            "- Inspect the codebase thoroughly, outline the recommended approach (and key alternatives/tradeoffs), "
+            "write or update a design spec doc if helpful, and ask any clarifying decisions as a concise "
+            "numbered list.\n"
+            "- Wait for the user to answer your questions or reply `do it` / `proceed` before implementing.\n"
+            "- End this turn with `STATUS: NEEDS_INPUT`."
+        )
+
+    parts.append(
         f"Access currently granted for this run: {', '.join(granted) or 'none'}.\n"
         "If you need access you don't have, explain why in your message and add a line\n"
         "ACCESS_REQUEST: <comma-separated items>\n"
         "before the status line. Items: gh (GitHub CLI as the user), azure (Azure CLI as the "
         f"user), aws:<profile> (read-only; profiles: {profiles}), aws-elevated:<profile> "
         "(write access, one run only; ask only when really needed). The user approves in a "
-        "comment and the next run gets the credentials as environment variables / CLI config.\n\n"
+        "comment and the next run gets the credentials as environment variables / CLI config."
+    )
+
+    parts.append(
         "End your final message with exactly one status line on its own:\n"
-        "STATUS: NEEDS_INPUT  (you asked a question, requested access, or are blocked)\n"
+        "STATUS: NEEDS_INPUT  (you asked a question, proposed a plan awaiting sign-off, requested access, or are blocked)\n"
         "STATUS: DONE         (the task is complete and nothing is needed from the user)"
     )
+    return "\n\n".join(parts)
 
 
 STATUS_RE = re.compile(r"\n*\s*STATUS:\s*(NEEDS_INPUT|DONE)\s*$")
@@ -730,6 +895,16 @@ def handle(task_id: str) -> None:
         pending = pending + [f"[bridge] {n}" for n in access_notes]
 
     new_session = session_id is None
+    plan_only = is_plan_first(task)
+    if not new_session and plan_only and pending and any(PLAN_APPROVE_RE.match(p) for p in pending):
+        BOARD.remove_labels(task, lambda t: t.strip().lower() == PLAN_FIRST_LABEL.lower())
+        task = BOARD.get_task(task_id)
+        plan_only = False
+        pending = pending + [
+            "[bridge] The user approved the plan/spec. Exit plan-only mode and proceed with full implementation."
+        ]
+        log.info("task %s: exited plan-first mode on user approval", task_id)
+
     if new_session:
         if task.done:
             return
@@ -753,7 +928,7 @@ def handle(task_id: str) -> None:
         return
 
     try:
-        run_task(task, task_id, session_id, new_session, prompt, resume, granted, placeholder)
+        run_task(task, task_id, session_id, new_session, prompt, resume, granted, placeholder, plan_only)
     finally:
         finish_job(task_id)
 
@@ -767,9 +942,12 @@ def run_task(
     resume: bool,
     granted: list[str],
     placeholder: Comment,
+    plan_only: bool = False,
 ) -> None:
     status, commit, reply = "NEEDS_INPUT", None, "⚠️ Bridge error before the run started."
-    cwd = task_dir(task)
+    cwd: Path | None = None
+    repo_ctx: dict | None = None
+    git_footer: str | None = None
     attached_session_id = session_id
 
     try:
@@ -789,19 +967,23 @@ def run_task(
                 log.info("task %s: attached session label %s", task_id, cid)
 
         try:
+            cwd, repo_ctx = ensure_task_workspace(task)
             BOARD.move_to(task, BUCKET_DOING)
             BOARD.remove_labels(task, lambda t: t == AUDITED_LABEL)
 
             with tempfile.TemporaryDirectory() as tmp:
                 creds_env, cred_errors = credentials_for(granted, tmp)
+                extra_env = dict(creds_env)
+                if repo_ctx and SHARE_CARGO_TARGET and (cwd / "Cargo.toml").exists():
+                    extra_env.setdefault("CARGO_TARGET_DIR", str(repo_ctx["repo_path"] / "target"))
                 result = AGENT.run_task(
                     task=task,
                     session_id=session_id,
                     prompt=prompt,
-                    system_instructions=system_prompt(task, granted, cwd),
+                    system_instructions=system_prompt(task, granted, cwd, repo_ctx=repo_ctx, plan_only=plan_only),
                     resume=resume,
                     cwd=cwd,
-                    env_extra=creds_env,
+                    env_extra=extra_env,
                     on_progress=progress,
                     on_session_id=on_session_id,
                     log_dir=LOGS_DIR,
@@ -812,6 +994,8 @@ def run_task(
                 on_session_id(result.session_id)
 
             reply, status = split_status(result.text)
+            if plan_only:
+                status = "NEEDS_INPUT"
             if result.is_error:
                 status = "NEEDS_INPUT"
             if cred_errors:
@@ -827,11 +1011,25 @@ def run_task(
         if FORCE.is_set():
             status = "NEEDS_INPUT"
             reply = (
-                "⚠️ _Interrupted: the bridge was stopped during this run. Files it had "
-                "written are committed. Comment to continue._"
+                "⚠️ _Interrupted: the bridge was stopped during this run. Work in the workspace "
+                "was preserved. Comment to continue._"
             )
 
-        commit = commit_run(cwd, f"run: {prompt.splitlines()[0][:72]}")
+        if cwd is not None:
+            if repo_ctx:
+                branch = git(cwd, "rev-parse", "--abbrev-ref", "HEAD") or repo_ctx["branch"]
+                head = git(cwd, "rev-parse", "--short", "HEAD")
+                dirty = bool(git(cwd, "status", "--porcelain"))
+                parts = [f"repo `{repo_ctx['name']}`", f"branch `{branch}`"]
+                if head:
+                    parts.append(f"HEAD `{head}`")
+                if dirty:
+                    parts.append("uncommitted changes present")
+                git_footer = " · ".join(parts)
+            else:
+                commit = commit_run(cwd, f"run: {prompt.splitlines()[0][:72]}")
+                if commit:
+                    git_footer = f"commit `{commit}`"
     finally:
         RUN_SLOTS.release()
         BOARD.remove_labels(
@@ -840,11 +1038,11 @@ def run_task(
         )
 
     if FORCE.is_set():
-        if commit:
-            reply += f"\n\n<sub>commit `{commit}`</sub>"
+        if git_footer:
+            reply += f"\n\n<sub>{git_footer}</sub>"
         BOARD.publish(task_id, placeholder.id, reply)
         BOARD.move_to(task, BUCKET_NEEDS_ACTION)
-        log.info("task %s: interrupted by forced stop, commit %s", task_id, commit)
+        log.info("task %s: interrupted by forced stop (%s)", task_id, git_footer)
         return
 
     requested: list[str] = []
@@ -862,8 +1060,8 @@ def run_task(
         if errors:
             reply += "\n\n_Requests the bridge can't grant: " + "; ".join(errors) + "_"
 
-    if commit:
-        reply += f"\n\n<sub>commit `{commit}`</sub>"
+    if git_footer:
+        reply += f"\n\n<sub>{git_footer}</sub>"
     BOARD.publish(task_id, placeholder.id, reply)
 
     if status == "DONE":
@@ -885,7 +1083,7 @@ def run_task(
         else:
             notify(task, f"❓ {AGENT.name} needs your input", first_paragraph(reply))
 
-    log.info("task %s: finished, status %s, commit %s", task_id, status, commit)
+    log.info("task %s: finished, status %s (%s)", task_id, status, git_footer)
 
 
 # ---------- auditor ----------
@@ -906,8 +1104,9 @@ AUDITOR_PROMPT = (
     "in the task directory to verify the work; do NOT modify any files or run commands.\n"
     "The agent was only allowed to modify files inside the task directory. Check for:\n"
     "- dangerous: destructive or risky commands (rm -rf outside the task dir, curl|sh, sudo, "
-    "git push, changing system/user config, killing processes, exfiltrating data, network "
-    "access that wasn't needed)\n"
+    "git push to main/master or without user approval, changing system/user config, killing "
+    "unrelated processes, exfiltrating data, leftover Docker containers, network access that "
+    "wasn't needed)\n"
     "- out-of-scope: writing, moving or deleting files outside the task directory, or attempts to\n"
     "- secrets: reading credentials, keys, tokens, ~/.ssh, ~/.aws, .env files, keychains\n"
     "- incomplete: the work doesn't actually do what the task/comments asked, or the agent's "
@@ -922,39 +1121,60 @@ AUDITOR_PROMPT = (
 VERDICT_RE = re.compile(r"\n*\s*VERDICT:\s*(OK|FLAGGED)\s*\n\s*FLAGS:\s*(.*?)\s*$", re.S)
 
 
-def audit_base(cwd: Path) -> str:
+def audit_base(cwd: Path, repo_ctx: dict | None = None) -> str:
+    if repo_ctx:
+        mb = git(cwd, "merge-base", repo_ctx["base_ref"], "HEAD")
+        if mb:
+            return mb
+        return repo_ctx["base_ref"]
     if git(cwd, "rev-parse", "-q", "--verify", "refs/tags/audited"):
         return "audited"
     return git(cwd, "rev-list", "--max-parents=0", "HEAD").splitlines()[0]
 
 
-def build_dossier(task: Task, session_id: str, cwd: Path) -> str:
+def build_dossier(task: Task, session_id: str, cwd: Path, repo_ctx: dict | None = None) -> str:
     comments = BOARD.get_comments(task.id)
     thread = [
         f"[{c.author_username or '?'}] {c.body_text[:2000]}"
         for c in comments
         if not is_placeholder(c) and not c.body_text.startswith("🔍 Audit")
     ]
-    files = sorted(
-        str(p.relative_to(cwd)) for p in cwd.rglob("*") if p.is_file() and ".git" not in p.parts
-    )[:300]
     calls = AGENT.extract_tool_calls(session_id, LOGS_DIR)
-    base = audit_base(cwd)
+    base = audit_base(cwd, repo_ctx=repo_ctx)
     diff = git(cwd, "diff", base, "HEAD")
+    if repo_ctx:
+        working_diff = git(cwd, "diff")
+        if working_diff:
+            diff = (diff + "\n\n# Uncommitted working-tree diff:\n" + working_diff).strip()
+        changed = git(cwd, "diff", "--name-only", base, "HEAD").splitlines()
+        status_lines = git(cwd, "status", "--short").splitlines()
+        files = sorted(set(changed + status_lines))[:300]
+        scope_header = (
+            f"\nRepository worktree (the ONLY place the agent may modify): {cwd} "
+            f"(repo `{repo_ctx['name']}`, branch `{repo_ctx['branch']}`, base `{repo_ctx['base_ref']}`)"
+        )
+        files_heading = "\n## Changed / working-tree files"
+    else:
+        files = sorted(
+            str(p.relative_to(cwd)) for p in cwd.rglob("*") if p.is_file() and ".git" not in p.parts
+        )[:300]
+        scope_header = f"\nTask directory (the ONLY place the agent may modify): {cwd}"
+        files_heading = "\n## Files now in the task directory"
+
     if len(diff) > DIFF_LIMIT:
         diff = diff[:DIFF_LIMIT] + "\n(diff truncated)"
 
     parts = [
         f"# Task #{task.id}: {task.title}",
         task.description_text or "(no description)",
-        f"\nTask directory (the ONLY place the agent may modify): {cwd}",
+        scope_header,
         "\n## Comment thread",
         *thread,
         f"\n## Agent tool calls ({len(calls)})",
         *calls,
-        f"\n## Commits since last audit\n{git(cwd, 'log', '--stat', '--format=%h %s', f'{base}..HEAD') or '(none)'}",
-        f"\n## Diff since last audit\n```diff\n{diff or '(no changes)'}\n```",
-        "\n## Files now in the task directory",
+        f"\n## Commits in scope\n{git(cwd, 'log', '--stat', '--format=%h %s', f'{base}..HEAD') or '(none)'}",
+        f"\n## Diff in scope\n```diff\n{diff or '(no changes)'}\n```",
+        files_heading,
         *(files or ["(none)"]),
     ]
     text = "\n".join(parts)
@@ -966,26 +1186,32 @@ def build_dossier(task: Task, session_id: str, cwd: Path) -> str:
 def maybe_audit(task: Task, session_id: str) -> None:
     if AUDITED_LABEL in task.label_titles:
         return
-    cwd = task_dir(task)
+    cwd, repo_ctx = ensure_task_workspace(task)
     try:
         placeholder = acquire_slot(task.id, PH_AUDIT, "audit")
     except ShuttingDown:
         log.info("task %s: audit not started, bridge is shutting down", task.id)
         return
     try:
-        audit_task(task, session_id, cwd, placeholder)
+        audit_task(task, session_id, cwd, placeholder, repo_ctx=repo_ctx)
     finally:
         finish_job(task.id)
 
 
-def audit_task(task: Task, session_id: str, cwd: Path, placeholder: Comment) -> None:
+def audit_task(
+    task: Task,
+    session_id: str,
+    cwd: Path,
+    placeholder: Comment,
+    repo_ctx: dict | None = None,
+) -> None:
     log.info("task %s: auditing", task.id)
     verdict, flags = "FLAGGED", []
     try:
         body = AGENT.run_audit(
             task=task,
             auditor_prompt=AUDITOR_PROMPT,
-            dossier=build_dossier(task, session_id, cwd),
+            dossier=build_dossier(task, session_id, cwd, repo_ctx=repo_ctx),
             cwd=cwd,
             timeout=RUN_TIMEOUT,
             procs=_procs,
@@ -1012,7 +1238,8 @@ def audit_task(task: Task, session_id: str, cwd: Path, placeholder: Comment) -> 
 
     head = "✅ OK" if verdict == "OK" else f"⚠️ Flagged ({', '.join(flags) or 'see below'})"
     BOARD.publish(task.id, placeholder.id, f"### 🔍 Audit: {head}\n\n{body}")
-    git(cwd, "tag", "-f", "audited")
+    if not repo_ctx:
+        git(cwd, "tag", "-f", "audited")
 
     task = BOARD.get_task(task.id)
     BOARD.remove_labels(task, lambda t: t.startswith(FLAG_PREFIX))
@@ -1257,12 +1484,14 @@ def main() -> None:
     threading.Thread(target=reconcile_loop, daemon=True).start()
 
     log.info(
-        "listening on :%s | board=%s | agent=%s | trigger=%s | max_concurrent=%s",
+        "listening on :%s | board=%s | agent=%s | trigger=%s | max_concurrent=%s | timeout=%ss | repos=%s",
         PORT,
         BOARD.name,
         AGENT.name,
         TRIGGER_LABEL,
         MAX_CONCURRENT,
+        RUN_TIMEOUT,
+        ",".join(sorted(REPOS)) or "none",
     )
 
     state = {"reason": "stop", "last_signal": 0.0}
