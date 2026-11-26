@@ -28,6 +28,12 @@ services:
       - BASE_URL=http://localhost:3000
       - TRUST_PROXY=false
       - SWAGGER_EXPOSED=true
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
     volumes:
       - planka_favicons:/app/public/favicons
       - planka_avatars:/app/public/user-avatars

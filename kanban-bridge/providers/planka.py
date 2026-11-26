@@ -35,10 +35,12 @@ HEX_TO_PLANKA_COLOR = {
     "4caf50": "fresh-salad",     # audited
     "e53935": "berry-red",       # audit:*
     "7e57c2": "lilac-eyes",      # access:*
-    "9e9e9e": "muddy-grey",      # session:* (if ever created as a label)
-    "4f7cff": "lagoon-blue",     # agy trigger
+    "9e9e9e": "muddy-grey",      # session:* / scratch
+    "4f7cff": "lagoon-blue",     # agy trigger / worktree
     "fbc02d": "egg-yellow",      # plan-first
     "1e88e5": "antique-blue",    # repo:*
+    "fb8c00": "pumpkin-orange",  # in-place
+    "43a047": "sunny-grass",     # direct
 }
 
 

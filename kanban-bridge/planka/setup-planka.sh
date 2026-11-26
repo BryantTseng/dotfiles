@@ -127,6 +127,10 @@ existing_labels = {l.get("name"): l for l in (inc.get("labels") or []) if l.get(
 default_labels = [
     ("agy", "lagoon-blue"),
     ("plan-first", "egg-yellow"),
+    ("direct", "sunny-grass"),
+    ("worktree", "lagoon-blue"),
+    ("in-place", "pumpkin-orange"),
+    ("scratch", "muddy-grey"),
     ("repo:clerk", "antique-blue"),
     ("repo:dotfiles", "deep-ocean"),
 ]

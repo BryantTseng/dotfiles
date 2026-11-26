@@ -239,13 +239,23 @@ def cmd_create(cli: PlankaClient, args) -> None:
         cli.req("POST", f"/cards/{cid}/card-labels", {"labelId": str(lbl["id"])})
 
     attached = []
+    ws = (args.workspace or "").strip().lower()
     if args.repo:
         repo_lbl = f"repo:{args.repo.strip().lower()}"
         ensure_and_attach(repo_lbl, "antique-blue")
         attached.append(repo_lbl)
+        if ws in ("worktree", "in-place"):
+            ensure_and_attach(ws, "lagoon-blue" if ws == "worktree" else "pumpkin-orange")
+            attached.append(ws)
+    elif ws == "scratch":
+        ensure_and_attach("scratch", "muddy-grey")
+        attached.append("scratch")
     if args.plan_first:
         ensure_and_attach("plan-first", "egg-yellow")
         attached.append("plan-first")
+    elif args.direct:
+        ensure_and_attach("direct", "sunny-grass")
+        attached.append("direct")
     if args.trigger:
         ensure_and_attach(cli.trigger_label, "lagoon-blue")
         attached.append(cli.trigger_label)
@@ -363,8 +373,14 @@ def main() -> None:
     p_create.add_argument("title")
     p_create.add_argument("--desc", default="")
     p_create.add_argument("--list", default="Backlog")
-    p_create.add_argument("--repo", help="Attach repo:<name> label to run in a git worktree of that repo")
+    p_create.add_argument("--repo", help="Attach repo:<name> label (e.g. clerk, dotfiles)")
+    p_create.add_argument(
+        "--workspace",
+        choices=["worktree", "in-place", "scratch"],
+        help="Workspace mode: isolated git worktree, in-place repo dir, or standalone scratch dir",
+    )
     p_create.add_argument("--plan-first", action="store_true", help="Attach plan-first label (spec/Q&A before coding)")
+    p_create.add_argument("--direct", action="store_true", help="Attach direct label (start coding immediately)")
     p_create.add_argument("--trigger", action="store_true", help="Attach 'agy' trigger label to start a run")
 
     p_move = sub.add_parser("move", help="Move a card to a column by name")

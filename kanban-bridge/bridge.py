@@ -63,9 +63,15 @@ MAX_CONCURRENT = int(ENV.get("BRIDGE_MAX_CONCURRENT", "2"))
 
 TRIGGER_LABEL = ENV.get("BRIDGE_TRIGGER_LABEL", "agy")
 PLAN_FIRST_LABEL = ENV.get("BRIDGE_PLAN_FIRST_LABEL", "plan-first")
+DIRECT_LABEL = "direct"
+WORKTREE_LABEL = "worktree"
+INPLACE_LABEL = "in-place"
+SCRATCH_LABEL = "scratch"
 REPO_LABEL_PREFIX = "repo:"
 SESSION_PREFIX = "session:"
 SESSION_COLOR = "9e9e9e"
+INTAKE_HEAD = "⚙️ Configure this run"
+REQUIRE_INTAKE = ENV.get("BRIDGE_REQUIRE_INTAKE", "1") == "1"
 
 # Repo mapping for git-worktree-backed cards: e.g. "clerk=~/workspace/clerk,dotfiles=~/workspace/dotfiles"
 def _parse_repos(raw: str) -> dict[str, Path]:
@@ -192,6 +198,9 @@ def _slug(title: str) -> str:
 
 def resolve_repo(task: Task) -> tuple[str | None, Path | None]:
     """Match a card to a configured local git repo via `repo:<name>` label or board name."""
+    lower_labels = {l.strip().lower() for l in task.label_titles}
+    if SCRATCH_LABEL in lower_labels:
+        return None, None
     for lbl in task.label_titles:
         low = lbl.strip().lower()
         if low.startswith(REPO_LABEL_PREFIX):
@@ -208,6 +217,54 @@ def resolve_repo(task: Task) -> tuple[str | None, Path | None]:
     return None, None
 
 
+def workspace_mode_of(task: Task) -> str | None:
+    """Return 'scratch', 'worktree', 'in-place', or None if not yet chosen."""
+    low = {l.strip().lower() for l in task.label_titles}
+    if SCRATCH_LABEL in low:
+        return SCRATCH_LABEL
+    if INPLACE_LABEL in low:
+        return INPLACE_LABEL
+    if WORKTREE_LABEL in low:
+        return WORKTREE_LABEL
+    return None
+
+
+def execution_mode_of(task: Task) -> str | None:
+    """Return 'plan-first', 'direct', or None if not yet chosen."""
+    low = {l.strip().lower() for l in task.label_titles}
+    if PLAN_FIRST_LABEL.lower() in low or BOARD.current_bucket(task) == BUCKET_PLANNING:
+        return PLAN_FIRST_LABEL
+    if DIRECT_LABEL in low:
+        return DIRECT_LABEL
+    return None
+
+
+def needs_intake(task: Task) -> bool:
+    """Return True when a new card hasn't explicitly chosen workspace mode and plan-first/direct."""
+    if not REQUIRE_INTAKE or task.done or session_of(task) is not None:
+        return False
+    ws = workspace_mode_of(task)
+    mode = execution_mode_of(task)
+    if mode is None or ws is None:
+        return True
+    # If worktree/in-place was picked, a repo must also be selected
+    if ws in (WORKTREE_LABEL, INPLACE_LABEL):
+        try:
+            rname, _ = resolve_repo(task)
+        except RuntimeError:
+            return True
+        if not rname:
+            return True
+    return False
+
+
+def has_intake_comment(comments: list[Comment]) -> Comment | None:
+    for c in reversed(comments):
+        if BOARD.is_from_bot(c) and INTAKE_HEAD in c.body_text:
+            return c
+    return None
+
+
 def _default_base_ref(repo_path: Path) -> str:
     for ref in ("origin/main", "origin/master", "main", "master"):
         if git(repo_path, "rev-parse", "-q", "--verify", ref):
@@ -218,15 +275,27 @@ def _default_base_ref(repo_path: Path) -> str:
 def ensure_task_workspace(task: Task) -> tuple[Path, dict | None]:
     """Return `(cwd, repo_ctx)`.
 
-    - For repo-backed cards (`repo:<name>` or board matching `BRIDGE_REPOS`), creates or reuses
-      an isolated `git worktree` on branch `kanban/<id-tail>-<slug>` off the repo's default branch.
-    - Otherwise creates or reuses a standalone scratch git repo in `TASKS_ROOT`.
+    - `repo:<name>` + `in-place`: runs directly inside `~/workspace/<repo>` on its current branch.
+    - `repo:<name>` (+ `worktree` or default): creates/reuses an isolated `git worktree` on branch
+      `kanban/<id-tail>-<slug>` off the repo's default branch.
+    - `scratch` (or no repo): creates/reuses a standalone scratch git repo in `TASKS_ROOT`.
     """
     slug = _slug(task.title)
+    ws_mode = workspace_mode_of(task)
     repo_name, repo_path = resolve_repo(task)
     if repo_name and repo_path:
         if not (repo_path / ".git").exists():
             raise RuntimeError(f"Configured repo `{repo_name}` is not a git repo: {repo_path}")
+        if ws_mode == INPLACE_LABEL:
+            branch = git(repo_path, "rev-parse", "--abbrev-ref", "HEAD") or "HEAD"
+            base_ref = _default_base_ref(repo_path)
+            return repo_path, {
+                "name": repo_name,
+                "repo_path": repo_path,
+                "branch": branch,
+                "base_ref": base_ref,
+                "mode": INPLACE_LABEL,
+            }
         with _repo_lock(repo_name):
             existing = sorted(TASKS_ROOT.glob(f"{repo_name}-task-{task.id}-*"))
             if existing and (existing[0] / ".git").exists():
@@ -238,9 +307,9 @@ def ensure_task_workspace(task: Task) -> tuple[Path, dict | None]:
                     "repo_path": repo_path,
                     "branch": branch,
                     "base_ref": base_ref,
+                    "mode": WORKTREE_LABEL,
                 }
 
-            # Best-effort fetch so the new worktree branches off latest default branch
             subprocess.run(
                 ["git", "-C", str(repo_path), "fetch", "--prune", "origin"],
                 capture_output=True,
@@ -251,7 +320,6 @@ def ensure_task_workspace(task: Task) -> tuple[Path, dict | None]:
             short_id = task.id[-6:] if len(task.id) > 6 else task.id
             branch = f"kanban/{short_id}-{slug}"
             wt = TASKS_ROOT / f"{repo_name}-task-{task.id}-{slug}"
-            # If the branch already exists (e.g. previous worktree pruned), attach to it; else create it
             if git(repo_path, "rev-parse", "-q", "--verify", f"refs/heads/{branch}"):
                 cmd = ["git", "-C", str(repo_path), "worktree", "add", str(wt), branch]
             else:
@@ -265,6 +333,7 @@ def ensure_task_workspace(task: Task) -> tuple[Path, dict | None]:
                 "repo_path": repo_path,
                 "branch": branch,
                 "base_ref": base_ref,
+                "mode": WORKTREE_LABEL,
             }
 
     existing = sorted(TASKS_ROOT.glob(f"task-{task.id}-*"))
@@ -341,13 +410,22 @@ def system_prompt(
     ]
 
     if repo_ctx:
+        if repo_ctx.get("mode") == INPLACE_LABEL:
+            loc_line = (
+                f"You are working **in-place** inside repository `{repo_ctx['name']}` at `{cwd}` "
+                f"(current branch: `{repo_ctx['branch']}`). Do NOT discard unrelated uncommitted user "
+                "changes; create or switch to a feature branch before making commits. "
+            )
+        else:
+            loc_line = (
+                f"You are working inside an isolated `git worktree` of repository `{repo_ctx['name']}` "
+                f"at `{cwd}` on feature branch `{repo_ctx['branch']}` (branched from `{repo_ctx['base_ref']}`). "
+            )
         parts.append(
-            f"You are working inside an isolated `git worktree` of repository `{repo_ctx['name']}` "
-            f"at `{cwd}` on feature branch `{repo_ctx['branch']}` (branched from `{repo_ctx['base_ref']}`). "
-            "ONLY modify files inside this worktree.\n"
+            loc_line + "ONLY modify files inside this repository directory.\n"
             "- Follow the repository's own `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` rules (including "
             "multi-agent Dev Worker + Reviewer Gate workflows, linting, formatting, and test suites).\n"
-            "- Make clean, logical git commits directly on your feature branch (`" + repo_ctx["branch"] + "`). "
+            "- Make clean, logical git commits directly on your feature branch. "
             "NEVER commit to or push directly to `main` or `master`.\n"
             "- You may use rootless Docker for ephemeral integration test containers (e.g. Postgres), "
             "but you MUST stop and remove any ephemeral test containers before finishing.\n"
@@ -586,6 +664,231 @@ def handle_access_click(method: str, query: str) -> tuple[int, str]:
     return 200, access_page(
         f"{done}: {', '.join(items)}",
         "<p>The agent will continue shortly. You can close this tab.</p>" + back,
+    )
+
+
+# ---------- pre-run intake (workspace mode + plan-first/direct) ----------
+
+LABEL_COLORS = {
+    WORKTREE_LABEL: "4f7cff",
+    INPLACE_LABEL: "fb8c00",
+    SCRATCH_LABEL: "9e9e9e",
+    PLAN_FIRST_LABEL: "fbc02d",
+    DIRECT_LABEL: "43a047",
+}
+
+
+def sign_setup(task_id: str) -> str:
+    return hmac.new(SECRET.encode(), f"setup|{task_id}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def setup_link(task_id: str) -> str:
+    q = urllib.parse.urlencode({"t": task_id, "s": sign_setup(task_id)})
+    return f"{APPROVAL_BASE}/setup?{q}"
+
+
+def intake_comment_text(task: Task) -> str:
+    repo_examples = []
+    if REPOS:
+        first_repo = sorted(REPOS)[0]
+        repo_examples.append(f"`{first_repo} worktree plan-first`")
+        repo_examples.append(f"`{first_repo} in-place direct`")
+    repo_examples.append("`scratch direct`")
+    examples = ", ".join(repo_examples)
+    repos_list = ", ".join(f"`{r}`" for r in sorted(REPOS)) or "(none configured)"
+    return (
+        f"### {INTAKE_HEAD}\n\n"
+        f"Choose workspace & execution mode before `{AGENT.name}` starts (0 tokens used):\n\n"
+        f"👉 **[⚙️ Configure & Start]({setup_link(task.id)})**\n\n"
+        f"- **Workspace:** `worktree` *(isolated branch)* or `in-place` *(directly in repo)* for {repos_list}, "
+        "or `scratch` *(standalone folder)*\n"
+        "- **Mode:** `plan-first` *(spec & numbered Q&A before coding)* or `direct` *(implement right away)*\n\n"
+        f"<sub>or reply with keywords like {examples}, or attach the labels on this card</sub>"
+    )
+
+
+def apply_intake_selection(task: Task, workspace: str, mode: str) -> str:
+    """Apply workspace (`scratch` or `repo:<name>|worktree|in-place`) and mode (`plan-first`|`direct`)."""
+    BOARD.remove_labels(
+        task,
+        lambda t: t.strip().lower() in (WORKTREE_LABEL, INPLACE_LABEL, SCRATCH_LABEL, PLAN_FIRST_LABEL.lower(), DIRECT_LABEL)
+        or t.strip().lower().startswith(REPO_LABEL_PREFIX),
+    )
+    if workspace == SCRATCH_LABEL:
+        BOARD.add_label(task.id, SCRATCH_LABEL, LABEL_COLORS[SCRATCH_LABEL])
+        ws_desc = "scratch"
+    elif workspace.startswith("repo:") and "|" in workspace:
+        repo_part, ws_kind = workspace.split("|", 1)
+        repo_name = repo_part[len("repo:"):].strip().lower()
+        if repo_name not in REPOS or ws_kind not in (WORKTREE_LABEL, INPLACE_LABEL):
+            raise ValueError(f"Invalid workspace selection: {workspace!r}")
+        BOARD.add_label(task.id, f"{REPO_LABEL_PREFIX}{repo_name}", "1e88e5")
+        BOARD.add_label(task.id, ws_kind, LABEL_COLORS[ws_kind])
+        ws_desc = f"{repo_name} ({ws_kind})"
+    else:
+        raise ValueError(f"Invalid workspace selection: {workspace!r}")
+
+    if mode not in (PLAN_FIRST_LABEL, DIRECT_LABEL):
+        raise ValueError(f"Invalid execution mode: {mode!r}")
+    BOARD.add_label(task.id, mode, LABEL_COLORS[mode])
+    return f"{ws_desc} · {mode}"
+
+
+def apply_intake_reply(task: Task, pending: list[str]) -> list[str]:
+    """Parse intake keywords from user comments on a new card; returns non-config comments."""
+    remaining: list[str] = []
+    chosen_repo, _ = resolve_repo(task)
+    chosen_ws = workspace_mode_of(task)
+    chosen_mode = execution_mode_of(task)
+    changed = False
+
+    for text in pending:
+        tokens = [t.strip("`,.;:()[]").lower() for t in re.split(r"\s+", text.strip()) if t.strip()]
+        recognized = 0
+        for tok in tokens:
+            if tok == SCRATCH_LABEL:
+                chosen_ws, chosen_repo, recognized = SCRATCH_LABEL, None, recognized + 1
+            elif tok == WORKTREE_LABEL:
+                chosen_ws, recognized = WORKTREE_LABEL, recognized + 1
+            elif tok in (INPLACE_LABEL, "inplace"):
+                chosen_ws, recognized = INPLACE_LABEL, recognized + 1
+            elif tok in (PLAN_FIRST_LABEL.lower(), "plan", "plan-only", "spec"):
+                chosen_mode, recognized = PLAN_FIRST_LABEL, recognized + 1
+            elif tok in (DIRECT_LABEL, "implement", "code", "now"):
+                chosen_mode, recognized = DIRECT_LABEL, recognized + 1
+            elif tok.startswith(REPO_LABEL_PREFIX) and tok[len(REPO_LABEL_PREFIX):] in REPOS:
+                chosen_repo = tok[len(REPO_LABEL_PREFIX):]
+                recognized += 1
+            elif tok in REPOS:
+                chosen_repo = tok
+                recognized += 1
+        if recognized > 0:
+            changed = True
+            if recognized < len(tokens):
+                remaining.append(text)
+        else:
+            remaining.append(text)
+
+    if changed:
+        if chosen_ws == SCRATCH_LABEL:
+            BOARD.remove_labels(
+                task,
+                lambda t: t.strip().lower() in (WORKTREE_LABEL, INPLACE_LABEL)
+                or t.strip().lower().startswith(REPO_LABEL_PREFIX),
+            )
+            BOARD.add_label(task.id, SCRATCH_LABEL, LABEL_COLORS[SCRATCH_LABEL])
+        else:
+            if chosen_repo:
+                BOARD.remove_labels(
+                    task,
+                    lambda t: t.strip().lower() == SCRATCH_LABEL
+                    or (t.strip().lower().startswith(REPO_LABEL_PREFIX) and t.strip().lower() != f"{REPO_LABEL_PREFIX}{chosen_repo}"),
+                )
+                BOARD.add_label(task.id, f"{REPO_LABEL_PREFIX}{chosen_repo}", "1e88e5")
+            if chosen_ws in (WORKTREE_LABEL, INPLACE_LABEL):
+                other = INPLACE_LABEL if chosen_ws == WORKTREE_LABEL else WORKTREE_LABEL
+                BOARD.remove_labels(task, lambda t: t.strip().lower() in (other, SCRATCH_LABEL))
+                BOARD.add_label(task.id, chosen_ws, LABEL_COLORS[chosen_ws])
+        if chosen_mode in (PLAN_FIRST_LABEL, DIRECT_LABEL):
+            other_m = DIRECT_LABEL if chosen_mode == PLAN_FIRST_LABEL else PLAN_FIRST_LABEL
+            BOARD.remove_labels(task, lambda t: t.strip().lower() == other_m.lower())
+            BOARD.add_label(task.id, chosen_mode, LABEL_COLORS[chosen_mode])
+        log.info("task %s: applied intake reply (repo=%s ws=%s mode=%s)", task.id, chosen_repo, chosen_ws, chosen_mode)
+    return remaining
+
+
+def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple[int, str]:
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    task_id = q.get("t", "")
+    if not task_id or not hmac.compare_digest(q.get("s", ""), sign_setup(task_id)):
+        return 403, access_page("Invalid link", "<p>This setup link's signature doesn't match.</p>")
+
+    back = f'<p><a href="{BOARD.task_url(task_id)}">Back to the card</a></p>'
+    task = BOARD.get_task(task_id)
+    if session_of(task) is not None:
+        return 409, access_page("Already started", "<p>This card already has an active session.</p>" + back)
+
+    if method == "GET":
+        cur_repo, _ = resolve_repo(task)
+        cur_ws = workspace_mode_of(task)
+        cur_mode = execution_mode_of(task) or PLAN_FIRST_LABEL
+
+        if cur_ws == SCRATCH_LABEL:
+            default_ws = SCRATCH_LABEL
+        elif cur_repo:
+            default_ws = f"repo:{cur_repo}|{cur_ws or WORKTREE_LABEL}"
+        elif REPOS:
+            default_ws = f"repo:{sorted(REPOS)[0]}|{WORKTREE_LABEL}"
+        else:
+            default_ws = SCRATCH_LABEL
+
+        ws_radios = []
+        if cur_repo and cur_repo in REPOS:
+            # Repo is already chosen on the card/board: only ask worktree vs in-place for this repo.
+            rpath = REPOS[cur_repo]
+            for kind, desc in [
+                (WORKTREE_LABEL, f"<strong>{html.escape(cur_repo)}</strong> — isolated git worktree <small>(safe for parallel cards)</small>"),
+                (INPLACE_LABEL, f"<strong>{html.escape(cur_repo)}</strong> — in-place <small>({html.escape(str(rpath))})</small>"),
+            ]:
+                val = f"repo:{cur_repo}|{kind}"
+                chk = " checked" if val == default_ws else ""
+                ws_radios.append(f'<label style="display:block;margin:.45rem 0"><input type="radio" name="workspace" value="{html.escape(val)}"{chk}> {desc}</label>')
+        else:
+            for rname, rpath in sorted(REPOS.items()):
+                for kind, desc in [
+                    (WORKTREE_LABEL, f"<strong>{html.escape(rname)}</strong> — isolated git worktree <small>(safe for parallel cards)</small>"),
+                    (INPLACE_LABEL, f"<strong>{html.escape(rname)}</strong> — in-place <small>({html.escape(str(rpath))})</small>"),
+                ]:
+                    val = f"repo:{rname}|{kind}"
+                    chk = " checked" if val == default_ws else ""
+                    ws_radios.append(f'<label style="display:block;margin:.45rem 0"><input type="radio" name="workspace" value="{html.escape(val)}"{chk}> {desc}</label>')
+            chk_s = " checked" if default_ws == SCRATCH_LABEL else ""
+            ws_radios.append(
+                f'<label style="display:block;margin:.45rem 0"><input type="radio" name="workspace" value="scratch"{chk_s}> '
+                "<strong>Scratch folder</strong> <small>(standalone repo in ~/workspace/kanban-tasks/)</small></label>"
+            )
+
+        mode_radios = []
+        for mval, mdesc in [
+            (PLAN_FIRST_LABEL, "<strong>Plan first</strong> <small>(explore, write spec &amp; numbered Q&amp;A, wait for <code>do it</code>)</small>"),
+            (DIRECT_LABEL, "<strong>Implement directly</strong> <small>(start coding immediately)</small>"),
+        ]:
+            chk = " checked" if mval == cur_mode else ""
+            mode_radios.append(f'<label style="display:block;margin:.45rem 0"><input type="radio" name="mode" value="{mval}"{chk}> {mdesc}</label>')
+
+        body = (
+            f"<p><strong>{html.escape(task.title)}</strong></p>"
+            '<form method="post">'
+            '<fieldset style="border:1px solid #3c4359;border-radius:8px;padding:.8rem 1rem;margin-bottom:1rem">'
+            "<legend>Workspace</legend>"
+            + "".join(ws_radios)
+            + "</fieldset>"
+            '<fieldset style="border:1px solid #3c4359;border-radius:8px;padding:.8rem 1rem;margin-bottom:1rem">'
+            "<legend>Execution Mode</legend>"
+            + "".join(mode_radios)
+            + "</fieldset>"
+            '<button type="submit">Save &amp; Start Agy</button>'
+            "</form>"
+            + back
+        )
+        return 200, access_page(f"Configure card #{task.index or task.id}", body)
+
+    form = {k: v[0] for k, v in urllib.parse.parse_qs(post_body.decode("utf-8", "replace")).items()}
+    try:
+        summary = apply_intake_selection(task, form.get("workspace", ""), form.get("mode", ""))
+    except ValueError as e:
+        return 400, access_page("Invalid selection", f"<p>{html.escape(str(e))}</p>" + back)
+
+    intake_c = has_intake_comment(BOARD.get_comments(task_id))
+    if intake_c:
+        try:
+            BOARD.edit_comment(task_id, intake_c.id, f"⚙️ _Configured: `{summary}` — starting run…_")
+        except Exception:
+            pass
+    enqueue(task_id)
+    return 200, access_page(
+        f"Configured: {summary}",
+        "<p>Agy is starting now. You can close this tab.</p>" + back,
     )
 
 
@@ -895,6 +1198,25 @@ def handle(task_id: str) -> None:
         pending = pending + [f"[bridge] {n}" for n in access_notes]
 
     new_session = session_id is None
+    if new_session:
+        if task.done:
+            return
+        if needs_intake(task):
+            if pending:
+                pending = apply_intake_reply(task, pending)
+                task = BOARD.get_task(task_id)
+            if needs_intake(task):
+                if has_intake_comment(comments) is None:
+                    BOARD.post_comment(task_id, intake_comment_text(task))
+                    BOARD.move_to(task, BUCKET_NEEDS_ACTION)
+                    notify(
+                        task,
+                        "⚙️ Configure new card",
+                        "Choose worktree/in-place/scratch and plan-first/direct before starting.",
+                    )
+                    log.info("task %s: posted intake prompt (0 tokens)", task_id)
+                return
+
     plan_only = is_plan_first(task)
     if not new_session and plan_only and pending and any(PLAN_APPROVE_RE.match(p) for p in pending):
         BOARD.remove_labels(task, lambda t: t.strip().lower() == PLAN_FIRST_LABEL.lower())
@@ -906,8 +1228,6 @@ def handle(task_id: str) -> None:
         log.info("task %s: exited plan-first mode on user approval", task_id)
 
     if new_session:
-        if task.done:
-            return
         prompt = f"# {task.title}\n\n{task.description_text}".strip()
         if pending:
             prompt += "\n\nComments from the user:\n" + "\n\n".join(pending)
@@ -1137,7 +1457,9 @@ def build_dossier(task: Task, session_id: str, cwd: Path, repo_ctx: dict | None 
     thread = [
         f"[{c.author_username or '?'}] {c.body_text[:2000]}"
         for c in comments
-        if not is_placeholder(c) and not c.body_text.startswith("🔍 Audit")
+        if not is_placeholder(c)
+        and not c.body_text.startswith("🔍 Audit")
+        and not c.body_text.startswith("⚙️")
     ]
     calls = AGENT.extract_tool_calls(session_id, LOGS_DIR)
     base = audit_base(cwd, repo_ctx=repo_ctx)
@@ -1299,6 +1621,14 @@ def is_busy(task_id: str) -> bool:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _send_html(self, status: int, page: str):
+        data = page.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _access(self, method: str):
         if method == "POST":
             self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
@@ -1307,16 +1637,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             log.exception("access click failed")
             status, page = 500, access_page("Error", f"<p>{html.escape(str(e))}</p>")
-        data = page.encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self._send_html(status, page)
+
+    def _setup(self, method: str):
+        post_body = b""
+        if method == "POST":
+            post_body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        try:
+            status, page = handle_setup_click(method, urllib.parse.urlsplit(self.path).query, post_body)
+        except Exception as e:
+            log.exception("setup form failed")
+            status, page = 500, access_page("Error", f"<p>{html.escape(str(e))}</p>")
+        self._send_html(status, page)
 
     def do_GET(self):
         if self.path.startswith("/access?"):
             return self._access("GET")
+        if self.path.startswith("/setup?"):
+            return self._setup("GET")
         if self.path == "/health":
             payload = json.dumps({"ok": True, "board": BOARD.name, "agent": AGENT.name}).encode()
             self.send_response(200)
@@ -1331,6 +1669,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path.startswith("/access?"):
             return self._access("POST")
+        if self.path.startswith("/setup?"):
+            return self._setup("POST")
         body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
         headers_lower = {k.lower(): v for k, v in self.headers.items()}
         try:
@@ -1399,7 +1739,14 @@ def recover_interrupted() -> None:
 def needs_work(task: Task) -> bool:
     session_id = session_of(task)
     if session_id is None:
-        return not task.done
+        if task.done:
+            return False
+        if needs_intake(task):
+            comments = BOARD.get_comments(task.id)
+            if has_intake_comment(comments) is None:
+                return True
+            return bool(pending_user_comments(comments))
+        return True
     if pending_user_comments(BOARD.get_comments(task.id)):
         return True
     return wants_audit(task)

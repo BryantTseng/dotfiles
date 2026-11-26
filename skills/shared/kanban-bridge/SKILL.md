@@ -15,10 +15,14 @@ Self-hosted **Planka v2** board (live WebSockets + PostgreSQL) bridged to headle
 
 ## Critical Safety Rules
 
-1. **Trigger label starts real runs:** Adding the `agy` label (`1916814904292017170`) to any open card immediately starts a real, quota-consuming headless `agy` session. Never pass `--trigger` / `--confirm-trigger` unless explicitly instructed by the user.
-2. **Never touch session metadata:** Cards persist their conversation ID as an invisible Markdown comment `<!-- agy-session:<conversation-id> -->` at the bottom of the card description. Never add, edit, or delete it manually (`scripts/kanban.py edit` preserves it automatically).
-3. **Never grant access or click approvals:** `access:*` labels (`access:gh`, `access:azure`, `access:aws:<profile>`, `access:aws-elevated:<profile>`) and `/access?...` approval links are strictly the user's to grant. Never add `access:*` labels, post `approve`/`deny` comments, or POST to `/access`.
-4. **Never print secrets:** `~/.config/kanban-bridge/env` and `~/.config/kanban-bridge/planka.env` hold tokens/secrets (`chmod 600`). Never echo or log their contents.
+1. **Always ask before creating/triggering cards:** Whenever the user asks you to create a kanban card (and didn't already specify these), explicitly ask:
+   - **Workspace mode:** existing repo (`--repo clerk` / `--repo dotfiles`) in **`--workspace worktree`** *(isolated branch, safe for parallel cards)* vs. **`--workspace in-place`** *(directly in repo)*, or **`--workspace scratch`** *(standalone folder)*?
+   - **Execution mode:** **`--plan-first`** *(explore, write spec & numbered Q&A before coding)* or **`--direct`** *(implement immediately)*?
+   - **Start now?** Attach **`--trigger`** (`agy`) immediately or leave unstarted in Backlog/To-Do?
+2. **Trigger label starts real runs:** Adding the `agy` label (`1916814904292017170`) to any open card starts the bridge flow. If workspace or mode labels are missing, the bridge posts a zero-token `⚙️ Configure this run` prompt (`/setup?...`) on the card and waits in **Need Action** before spending any agent tokens. Never pass `--trigger` / `--confirm-trigger` unless explicitly instructed by the user.
+3. **Never touch session metadata:** Cards persist their conversation ID as an invisible Markdown comment `<!-- agy-session:<conversation-id> -->` at the bottom of the card description. Never add, edit, or delete it manually (`scripts/kanban.py edit` preserves it automatically).
+4. **Never grant access or click approvals:** `access:*` labels (`access:gh`, `access:azure`, `access:aws:<profile>`, `access:aws-elevated:<profile>`) and `/access?...` approval links are strictly the user's to grant. Never add `access:*` labels, post `approve`/`deny` comments, or POST to `/access`.
+5. **Never print secrets:** `~/.config/kanban-bridge/env` and `~/.config/kanban-bridge/planka.env` hold tokens/secrets (`chmod 600`). Never echo or log their contents.
 
 ## Operating the Board (`scripts/kanban.py`)
 
@@ -40,11 +44,15 @@ $KANBAN show <card_id>
 # Create a card (defaults to Backlog, does NOT trigger an agy run)
 $KANBAN create "Task title" --desc "Details..." --list "To-Do"
 
-# Create a repo-backed, plan-first card (git worktree of clerk, spec/Q&A before coding)
-$KANBAN create "Backtest feature" --desc "Details..." --list "To-Do" --repo clerk --plan-first
+# Create a repo-backed, plan-first card (isolated git worktree of clerk, spec/Q&A before coding)
+$KANBAN create "Backtest feature" --desc "Details..." --list "To-Do" --repo clerk --workspace worktree --plan-first
+
+# Create an in-place or standalone scratch card implementing directly
+$KANBAN create "Quick fix" --desc "Details..." --list "To-Do" --repo clerk --workspace in-place --direct
+$KANBAN create "Scratch note" --desc "Details..." --list "To-Do" --workspace scratch --direct
 
 # Create AND immediately start an agy run (ONLY when user explicitly asks!)
-$KANBAN create "Task title" --desc "Details..." --list "To-Do" --repo clerk --plan-first --trigger
+$KANBAN create "Task title" --desc "Details..." --list "To-Do" --repo clerk --workspace worktree --plan-first --trigger
 
 # Move a card between columns (e.g. drag to Auditing to trigger read-only audit)
 $KANBAN move <card_id> "Auditing"
