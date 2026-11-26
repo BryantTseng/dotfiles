@@ -94,8 +94,9 @@ $KANBAN delete <card_id>
 
 - **Source of truth:** `~/workspace/dotfiles/kanban-bridge/` (symlinked at `~/workspace/kanban-bridge`)
 - **Task repos & worktrees:**
+  - Dedicated bridge repos dir: `~/workspace/kanban-bridge/repos/<name>` (auto-discovered via `BRIDGE_REPOS_ROOT`; keeps the user's personal `~/workspace` untouched).
   - Scratch cards: `~/workspace/kanban-tasks/task-<id>-<slug>/`
-  - Repo-backed cards (`repo:<name>` label or board matching `BRIDGE_REPOS`): isolated `git worktree` at `~/workspace/kanban-tasks/<repo>-task-<id>-<slug>/` on branch `kanban/<id-tail>-<slug>` with shared `CARGO_TARGET_DIR` (clean up after PR merge with `git -C ~/workspace/<repo> worktree remove <path>`).
+  - Repo-backed cards (`repo:<name>` + `worktree` or `in-place`): isolated `git worktree` at `~/workspace/kanban-tasks/<repo>-task-<id>-<slug>/` on branch `kanban/<id-tail>-<slug>` with shared `CARGO_TARGET_DIR` (clean up after PR merge with `git -C ~/workspace/kanban-bridge/repos/<repo> worktree remove <path>`).
 - **Plan-first workflow:** Attach `plan-first` to run spec/Q&A first without modifying production code; replying `do it` / `proceed` automatically removes `plan-first` and unlocks implementation.
 - **Host audit logs:** `~/.local/share/kanban-bridge/logs/<conversation-id>.jsonl`
 - **Service commands:**

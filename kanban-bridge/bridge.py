@@ -73,9 +73,9 @@ SESSION_COLOR = "9e9e9e"
 INTAKE_HEAD = "⚙️ Configure this run"
 REQUIRE_INTAKE = ENV.get("BRIDGE_REQUIRE_INTAKE", "1") == "1"
 
-# Dynamic repo discovery: scans BRIDGE_WORKSPACE_ROOT/*/.git plus optional BRIDGE_REPOS overrides.
-WORKSPACE_ROOT = Path(ENV.get("BRIDGE_WORKSPACE_ROOT", "~/workspace")).expanduser().resolve()
-_IGNORED_WORKSPACE_DIRS = {"kanban-bridge", "kanban-tasks"}
+# Dynamic repo discovery: scans BRIDGE_REPOS_ROOT/*/.git (isolated from ~/workspace)
+# plus optional BRIDGE_REPOS overrides.
+REPOS_ROOT = Path(ENV.get("BRIDGE_REPOS_ROOT", "~/workspace/kanban-bridge/repos")).expanduser()
 
 
 def _parse_repos(raw: str) -> dict[str, Path]:
@@ -98,11 +98,11 @@ _repo_locks_guard = threading.Lock()
 
 
 def discover_repos() -> dict[str, Path]:
-    """Return available git repos: auto-discovered under WORKSPACE_ROOT + explicit BRIDGE_REPOS."""
+    """Return available git repos under REPOS_ROOT plus any explicit BRIDGE_REPOS."""
     out: dict[str, Path] = {}
-    if WORKSPACE_ROOT.is_dir():
-        for child in sorted(WORKSPACE_ROOT.iterdir()):
-            if child.name.startswith(".") or child.name in _IGNORED_WORKSPACE_DIRS:
+    if REPOS_ROOT.is_dir():
+        for child in sorted(REPOS_ROOT.iterdir()):
+            if child.name.startswith("."):
                 continue
             if child.is_dir() and (child / ".git").exists():
                 out[child.name.lower()] = child.resolve()
@@ -231,7 +231,7 @@ def resolve_repo(task: Task) -> tuple[str | None, Path | None]:
             if p.is_dir() and (p / ".git").exists():
                 return p.name.lower(), p
             raise RuntimeError(
-                f"Card requests `repo:{val}`, which was not found under {WORKSPACE_ROOT} or BRIDGE_REPOS "
+                f"Card requests `repo:{val}`, which was not found under {REPOS_ROOT} or BRIDGE_REPOS "
                 f"(available: {', '.join(sorted(repos)) or 'none'})."
             )
     board_key = (task.project_name or "").strip().lower()
@@ -1864,6 +1864,7 @@ def main() -> None:
     global BOARD, AGENT
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     TASKS_ROOT.mkdir(parents=True, exist_ok=True)
+    REPOS_ROOT.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     BOARD = load_board_provider(BOARD_NAME, ENV)

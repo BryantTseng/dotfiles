@@ -13,7 +13,7 @@ CFG_DIR="${HOME}/.config/kanban-bridge"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 WORKSPACE_LINK="${HOME}/workspace/kanban-bridge"
 
-mkdir -p "$CFG_DIR" "$SYSTEMD_USER_DIR" "${HOME}/workspace/kanban-tasks"
+mkdir -p "$CFG_DIR" "$SYSTEMD_USER_DIR" "${HOME}/workspace/kanban-tasks" "$SRC_DIR/repos"
 chmod 700 "$CFG_DIR"
 
 # 1. Symlink ~/workspace/kanban-bridge -> dotfiles/kanban-bridge
