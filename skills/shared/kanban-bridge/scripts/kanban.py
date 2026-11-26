@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Safe CLI for operating the local Planka v2 kanban board from agent sessions.
+
+Reads PLANKA_URL and PLANKA_API_KEY directly from ~/.config/kanban-bridge/env (never prints
+secrets). Enforces the kanban-bridge safety guardrails in code:
+  - Refuses to add/remove `access:*` or `session:*` labels.
+  - Refuses to post `approve` / `deny` comments.
+  - Preserves `<!-- agy-session:... -->` footers when editing card descriptions.
+  - Never attaches the trigger label (`agy`) unless `--trigger` / `--confirm-trigger` is passed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ENV_PATH = Path.home() / ".config/kanban-bridge/env"
+SESSION_TAG_RE = re.compile(r"\n*<!--\s*agy-session:([A-Za-z0-9._-]+)\s*-->\s*$")
+APPROVE_RE = re.compile(r"^\s*(approve|deny)\b", re.I)
+
+
+def load_env() -> dict[str, str]:
+    if not ENV_PATH.exists():
+        raise SystemExit(f"Config file not found: {ENV_PATH}")
+    out: dict[str, str] = {}
+    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip("'\"")
+    return out
+
+
+class PlankaClient:
+    def __init__(self, env: dict[str, str]):
+        self.base_url = env.get("PLANKA_URL", "http://localhost:3000").rstrip("/")
+        self.api_url = self.base_url + "/api"
+        self.api_key = env.get("PLANKA_API_KEY", "")
+        self.trigger_label = env.get("BRIDGE_TRIGGER_LABEL", "agy")
+        self.bridge_port = int(env.get("BRIDGE_PORT", "8787"))
+        if not self.api_key:
+            raise SystemExit("PLANKA_API_KEY is missing in ~/.config/kanban-bridge/env")
+
+    def req(self, method: str, path: str, body=None):
+        r = urllib.request.Request(
+            self.api_url + path,
+            method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"X-Api-Key": self.api_key, "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(r, timeout=20) as resp:
+                raw = resp.read()
+                return json.loads(raw, strict=False) if raw else None
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+            raise SystemExit(f"Planka API error {e.code} on {method} {path}: {detail}")
+
+    def resolve_board(self, board_arg: str | None) -> tuple[str, str]:
+        data = self.req("GET", "/projects") or {}
+        boards = (data.get("included") or {}).get("boards") or []
+        if not boards:
+            raise SystemExit("No Planka boards found.")
+        if board_arg:
+            for b in boards:
+                if str(b["id"]) == board_arg or (b.get("name") or "").lower() == board_arg.lower():
+                    return str(b["id"]), b.get("name") or str(b["id"])
+            raise SystemExit(f"Board not found: {board_arg!r}")
+        for b in boards:
+            if (b.get("name") or "").lower() == "agy":
+                return str(b["id"]), b["name"]
+        return str(boards[0]["id"]), boards[0].get("name") or str(boards[0]["id"])
+
+    def board_bundle(self, board_id: str) -> dict:
+        return self.req("GET", f"/boards/{board_id}") or {}
+
+
+def cmd_health(cli: PlankaClient, args) -> None:
+    me = cli.req("GET", "/users/me")["item"]
+    bridge_status = "down"
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{cli.bridge_port}/health", timeout=3) as r:
+            bridge_status = r.read().decode("utf-8").strip()
+    except Exception as e:
+        bridge_status = f"unreachable ({e})"
+    print(f"Planka: ok ({cli.base_url}, user={me.get('username') or me.get('email')})")
+    print(f"Bridge: {bridge_status}")
+
+
+def cmd_board(cli: PlankaClient, args) -> None:
+    bid, bname = cli.resolve_board(args.board)
+    inc = cli.board_bundle(bid).get("included") or {}
+    lists = sorted(
+        [l for l in (inc.get("lists") or []) if l.get("type") in ("active", "closed") and l.get("name")],
+        key=lambda l: l.get("position") or 0,
+    )
+    labels_by_id = {str(l["id"]): l.get("name") or "" for l in (inc.get("labels") or [])}
+    card_labels: dict[str, list[str]] = {}
+    for cl in inc.get("cardLabels") or []:
+        name = labels_by_id.get(str(cl["labelId"]), "")
+        if name:
+            card_labels.setdefault(str(cl["cardId"]), []).append(name)
+
+    cards_by_list: dict[str, list[dict]] = {}
+    for c in inc.get("cards") or []:
+        cards_by_list.setdefault(str(c.get("listId")), []).append(c)
+
+    if args.json:
+        out = {
+            "board": {"id": bid, "name": bname, "url": f"{cli.base_url}/boards/{bid}"},
+            "lists": [],
+        }
+        for l in lists:
+            lid = str(l["id"])
+            cards = sorted(cards_by_list.get(lid, []), key=lambda c: c.get("position") or 0)
+            out["lists"].append({
+                "id": lid,
+                "name": l["name"],
+                "type": l.get("type"),
+                "cards": [
+                    {
+                        "id": str(c["id"]),
+                        "name": c.get("name") or "",
+                        "labels": card_labels.get(str(c["id"]), []),
+                        "has_session": bool(SESSION_TAG_RE.search(c.get("description") or "")),
+                        "url": f"{cli.base_url}/cards/{c['id']}",
+                    }
+                    for c in cards
+                ],
+            })
+        print(json.dumps(out, indent=2))
+        return
+
+    print(f"Board: {bname} ({cli.base_url}/boards/{bid})\n")
+    for l in lists:
+        lid = str(l["id"])
+        cards = sorted(cards_by_list.get(lid, []), key=lambda c: c.get("position") or 0)
+        print(f"## {l['name']} ({len(cards)})  [list:{lid}]")
+        if not cards:
+            print("  (empty)")
+        for c in cards:
+            cid = str(c["id"])
+            lbls = card_labels.get(cid, [])
+            tag_str = f"  [{', '.join(lbls)}]" if lbls else ""
+            sess = " (session)" if SESSION_TAG_RE.search(c.get("description") or "") else ""
+            print(f"  - {cid}  {c.get('name') or ''}{tag_str}{sess}")
+        print()
+
+
+def cmd_show(cli: PlankaClient, args) -> None:
+    data = cli.req("GET", f"/cards/{args.card_id}") or {}
+    card = data["item"]
+    bid = str(card["boardId"])
+    inc = cli.board_bundle(bid).get("included") or {}
+    lists = {str(l["id"]): l.get("name") or "" for l in (inc.get("lists") or [])}
+    labels_by_id = {str(l["id"]): l.get("name") or "" for l in (inc.get("labels") or [])}
+    lbls = [
+        labels_by_id.get(str(cl["labelId"]), "")
+        for cl in ((data.get("included") or {}).get("cardLabels") or [])
+        if str(cl.get("cardId")) == str(card["id"])
+    ]
+    raw_desc = card.get("description") or ""
+    has_sess = bool(SESSION_TAG_RE.search(raw_desc))
+    desc = SESSION_TAG_RE.sub("", raw_desc).strip()
+
+    cdata = cli.req("GET", f"/cards/{args.card_id}/comments") or {}
+    users = {str(u["id"]): u.get("username") or u.get("name") or "?" for u in ((cdata.get("included") or {}).get("users") or [])}
+    comments = sorted(cdata.get("items") or [], key=lambda c: (c.get("createdAt") or "", int(c["id"])))
+
+    if args.json:
+        print(json.dumps({
+            "id": str(card["id"]),
+            "name": card.get("name") or "",
+            "list": lists.get(str(card.get("listId")), ""),
+            "labels": [x for x in lbls if x],
+            "has_session": has_sess,
+            "description": desc,
+            "url": f"{cli.base_url}/cards/{card['id']}",
+            "comments": [
+                {
+                    "id": str(c["id"]),
+                    "author": users.get(str(c.get("userId")), "?"),
+                    "createdAt": c.get("createdAt"),
+                    "text": c.get("text") or "",
+                }
+                for c in comments
+            ],
+        }, indent=2))
+        return
+
+    print(f"# {card.get('name')}  (id: {card['id']})")
+    print(f"URL:     {cli.base_url}/cards/{card['id']}")
+    print(f"List:    {lists.get(str(card.get('listId')), '?')}")
+    print(f"Labels:  {', '.join(x for x in lbls if x) or '(none)'}")
+    print(f"Session: {'attached' if has_sess else 'none'}")
+    if desc:
+        print(f"\n## Description\n{desc}")
+    print(f"\n## Comments ({len(comments)})")
+    for c in comments:
+        author = users.get(str(c.get("userId")), "?")
+        print(f"\n[{author} @ {c.get('createdAt', '')}]\n{(c.get('text') or '').strip()}")
+
+
+def cmd_create(cli: PlankaClient, args) -> None:
+    bid, _ = cli.resolve_board(args.board)
+    inc = cli.board_bundle(bid).get("included") or {}
+    lists = [l for l in (inc.get("lists") or []) if l.get("type") in ("active", "closed") and l.get("name")]
+    target = args.list.strip().lower()
+    lst = next((l for l in lists if l["name"].strip().lower() == target), None)
+    if not lst:
+        names = ", ".join(l["name"] for l in lists)
+        raise SystemExit(f"List {args.list!r} not found. Available: {names}")
+
+    payload = {"type": "project", "position": 65536, "name": args.title}
+    if args.desc:
+        payload["description"] = args.desc
+    card = cli.req("POST", f"/lists/{lst['id']}/cards", payload)["item"]
+    cid = str(card["id"])
+
+    if args.trigger:
+        lbl = next((l for l in (inc.get("labels") or []) if l.get("name") == cli.trigger_label), None)
+        if not lbl:
+            raise SystemExit(f"Trigger label {cli.trigger_label!r} not found on board {bid}")
+        cli.req("POST", f"/cards/{cid}/card-labels", {"labelId": str(lbl["id"])})
+
+    print(json.dumps({
+        "id": cid,
+        "name": card["name"],
+        "list": lst["name"],
+        "triggered": bool(args.trigger),
+        "url": f"{cli.base_url}/cards/{cid}",
+    }, indent=2))
+
+
+def cmd_move(cli: PlankaClient, args) -> None:
+    card = cli.req("GET", f"/cards/{args.card_id}")["item"]
+    inc = cli.board_bundle(str(card["boardId"])).get("included") or {}
+    lists = [l for l in (inc.get("lists") or []) if l.get("type") in ("active", "closed") and l.get("name")]
+    target = args.list.strip().lower()
+    lst = next((l for l in lists if l["name"].strip().lower() == target), None)
+    if not lst:
+        names = ", ".join(l["name"] for l in lists)
+        raise SystemExit(f"List {args.list!r} not found. Available: {names}")
+    cli.req("PATCH", f"/cards/{args.card_id}", {"listId": str(lst["id"]), "position": 65536})
+    print(f"Moved card {args.card_id} -> {lst['name']}")
+
+
+def cmd_edit(cli: PlankaClient, args) -> None:
+    card = cli.req("GET", f"/cards/{args.card_id}")["item"]
+    updates = {}
+    if args.title is not None:
+        updates["name"] = args.title
+    if args.desc is not None:
+        # Strictly preserve any existing invisible session tag
+        old_desc = card.get("description") or ""
+        m = SESSION_TAG_RE.search(old_desc)
+        clean_new = SESSION_TAG_RE.sub("", args.desc).rstrip()
+        if m:
+            tag = f"<!-- agy-session:{m.group(1)} -->"
+            updates["description"] = f"{clean_new}\n\n{tag}" if clean_new else tag
+        else:
+            updates["description"] = clean_new
+    if not updates:
+        raise SystemExit("Nothing to update (pass --title and/or --desc).")
+    cli.req("PATCH", f"/cards/{args.card_id}", updates)
+    print(f"Updated card {args.card_id}")
+
+
+def cmd_comment(cli: PlankaClient, args) -> None:
+    text = args.text.strip()
+    if not text:
+        raise SystemExit("Comment text cannot be empty.")
+    if APPROVE_RE.match(text):
+        raise SystemExit("Refused: agents may never post 'approve' or 'deny' access decisions.")
+    c = cli.req("POST", f"/cards/{args.card_id}/comments", {"text": text})["item"]
+    print(f"Posted comment {c['id']} on card {args.card_id}")
+
+
+def cmd_label(cli: PlankaClient, args) -> None:
+    name = args.label.strip()
+    lower = name.lower()
+    if lower.startswith(("access:", "session:")):
+        raise SystemExit(f"Refused: agents may never modify {name!r} labels.")
+    if args.action == "add" and lower == cli.trigger_label.lower() and not args.confirm_trigger:
+        raise SystemExit(
+            f"Refused: adding {cli.trigger_label!r} starts a real billed/quota run. "
+            "Pass --confirm-trigger only if the user explicitly asked to start the card."
+        )
+
+    card = cli.req("GET", f"/cards/{args.card_id}")["item"]
+    bid = str(card["boardId"])
+    inc = cli.board_bundle(bid).get("included") or {}
+    lbl = next((l for l in (inc.get("labels") or []) if l.get("name") == name), None)
+    if args.action == "add":
+        if not lbl:
+            max_pos = max((l.get("position") or 0 for l in (inc.get("labels") or [])), default=0)
+            lbl = cli.req(
+                "POST",
+                f"/boards/{bid}/labels",
+                {"name": name, "color": "lagoon-blue", "position": max_pos + 65536},
+            )["item"]
+        try:
+            cli.req("POST", f"/cards/{args.card_id}/card-labels", {"labelId": str(lbl["id"])})
+        except SystemExit as e:
+            if "409" not in str(e):
+                raise
+        print(f"Added label {name!r} to card {args.card_id}")
+    else:
+        if not lbl:
+            raise SystemExit(f"Label {name!r} not found on board {bid}")
+        cli.req("DELETE", f"/cards/{args.card_id}/card-labels/labelId:{lbl['id']}")
+        print(f"Removed label {name!r} from card {args.card_id}")
+
+
+def cmd_delete(cli: PlankaClient, args) -> None:
+    cli.req("DELETE", f"/cards/{args.card_id}")
+    print(f"Deleted card {args.card_id}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Safe CLI for operating the local Planka kanban board.")
+    p.add_argument("--board", help="Board ID or name (defaults to 'Agy')")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("health", help="Check Planka API and bridge /health")
+
+    p_board = sub.add_parser("board", help="List columns and cards")
+    p_board.add_argument("--json", action="store_true")
+
+    p_show = sub.add_parser("show", help="Show card details and comments")
+    p_show.add_argument("card_id")
+    p_show.add_argument("--json", action="store_true")
+
+    p_create = sub.add_parser("create", help="Create a card (defaults to Backlog, no trigger)")
+    p_create.add_argument("title")
+    p_create.add_argument("--desc", default="")
+    p_create.add_argument("--list", default="Backlog")
+    p_create.add_argument("--trigger", action="store_true", help="Attach 'agy' trigger label to start a run")
+
+    p_move = sub.add_parser("move", help="Move a card to a column by name")
+    p_move.add_argument("card_id")
+    p_move.add_argument("list")
+
+    p_edit = sub.add_parser("edit", help="Edit a card title/description (preserves session metadata)")
+    p_edit.add_argument("card_id")
+    p_edit.add_argument("--title")
+    p_edit.add_argument("--desc")
+
+    p_comment = sub.add_parser("comment", help="Post a comment on a card")
+    p_comment.add_argument("card_id")
+    p_comment.add_argument("text")
+
+    p_label = sub.add_parser("label", help="Add or remove a non-access label on a card")
+    p_label.add_argument("card_id")
+    p_label.add_argument("action", choices=["add", "remove"])
+    p_label.add_argument("label")
+    p_label.add_argument("--confirm-trigger", action="store_true")
+
+    p_del = sub.add_parser("delete", help="Delete a card")
+    p_del.add_argument("card_id")
+
+    args = p.parse_args()
+    cli = PlankaClient(load_env())
+    {
+        "health": cmd_health,
+        "board": cmd_board,
+        "show": cmd_show,
+        "create": cmd_create,
+        "move": cmd_move,
+        "edit": cmd_edit,
+        "comment": cmd_comment,
+        "label": cmd_label,
+        "delete": cmd_delete,
+    }[args.cmd](cli, args)
+
+
+if __name__ == "__main__":
+    main()
