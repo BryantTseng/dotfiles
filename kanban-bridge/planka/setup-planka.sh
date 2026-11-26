@@ -131,8 +131,6 @@ default_labels = [
     ("worktree", "lagoon-blue"),
     ("in-place", "pumpkin-orange"),
     ("scratch", "muddy-grey"),
-    ("repo:clerk", "antique-blue"),
-    ("repo:dotfiles", "deep-ocean"),
 ]
 for idx, (lname, lcolor) in enumerate(default_labels, start=1):
     if lname not in existing_labels:

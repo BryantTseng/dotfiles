@@ -73,7 +73,11 @@ SESSION_COLOR = "9e9e9e"
 INTAKE_HEAD = "⚙️ Configure this run"
 REQUIRE_INTAKE = ENV.get("BRIDGE_REQUIRE_INTAKE", "1") == "1"
 
-# Repo mapping for git-worktree-backed cards: e.g. "clerk=~/workspace/clerk,dotfiles=~/workspace/dotfiles"
+# Dynamic repo discovery: scans BRIDGE_WORKSPACE_ROOT/*/.git plus optional BRIDGE_REPOS overrides.
+WORKSPACE_ROOT = Path(ENV.get("BRIDGE_WORKSPACE_ROOT", "~/workspace")).expanduser().resolve()
+_IGNORED_WORKSPACE_DIRS = {"kanban-bridge", "kanban-tasks"}
+
+
 def _parse_repos(raw: str) -> dict[str, Path]:
     out: dict[str, Path] = {}
     for entry in (raw or "").split(","):
@@ -87,10 +91,23 @@ def _parse_repos(raw: str) -> dict[str, Path]:
     return out
 
 
-REPOS: dict[str, Path] = _parse_repos(ENV.get("BRIDGE_REPOS", ""))
+EXPLICIT_REPOS: dict[str, Path] = _parse_repos(ENV.get("BRIDGE_REPOS", ""))
 SHARE_CARGO_TARGET = ENV.get("BRIDGE_SHARE_CARGO_TARGET", "1") == "1"
 _repo_locks: dict[str, threading.Lock] = {}
 _repo_locks_guard = threading.Lock()
+
+
+def discover_repos() -> dict[str, Path]:
+    """Return available git repos: auto-discovered under WORKSPACE_ROOT + explicit BRIDGE_REPOS."""
+    out: dict[str, Path] = {}
+    if WORKSPACE_ROOT.is_dir():
+        for child in sorted(WORKSPACE_ROOT.iterdir()):
+            if child.name.startswith(".") or child.name in _IGNORED_WORKSPACE_DIRS:
+                continue
+            if child.is_dir() and (child / ".git").exists():
+                out[child.name.lower()] = child.resolve()
+    out.update(EXPLICIT_REPOS)
+    return out
 
 
 def _repo_lock(repo_name: str) -> threading.Lock:
@@ -197,23 +214,29 @@ def _slug(title: str) -> str:
 
 
 def resolve_repo(task: Task) -> tuple[str | None, Path | None]:
-    """Match a card to a configured local git repo via `repo:<name>` label or board name."""
+    """Match a card to a local git repo via `repo:<name|path>` label or matching board name."""
     lower_labels = {l.strip().lower() for l in task.label_titles}
     if SCRATCH_LABEL in lower_labels:
         return None, None
+    repos = discover_repos()
     for lbl in task.label_titles:
-        low = lbl.strip().lower()
+        raw = lbl.strip()
+        low = raw.lower()
         if low.startswith(REPO_LABEL_PREFIX):
-            name = low[len(REPO_LABEL_PREFIX):].strip()
-            if name in REPOS:
-                return name, REPOS[name]
+            val = raw[len(REPO_LABEL_PREFIX):].strip()
+            key = val.lower()
+            if key in repos:
+                return key, repos[key]
+            p = Path(val).expanduser().resolve()
+            if p.is_dir() and (p / ".git").exists():
+                return p.name.lower(), p
             raise RuntimeError(
-                f"Card requests `repo:{name}`, which is not configured in BRIDGE_REPOS "
-                f"(available: {', '.join(sorted(REPOS)) or 'none'})."
+                f"Card requests `repo:{val}`, which was not found under {WORKSPACE_ROOT} or BRIDGE_REPOS "
+                f"(available: {', '.join(sorted(repos)) or 'none'})."
             )
     board_key = (task.project_name or "").strip().lower()
-    if board_key and board_key in REPOS:
-        return board_key, REPOS[board_key]
+    if board_key and board_key in repos:
+        return board_key, repos[board_key]
     return None, None
 
 
@@ -688,45 +711,51 @@ def setup_link(task_id: str) -> str:
 
 
 def intake_comment_text(task: Task) -> str:
-    repo_examples = []
-    if REPOS:
-        first_repo = sorted(REPOS)[0]
-        repo_examples.append(f"`{first_repo} worktree plan-first`")
-        repo_examples.append(f"`{first_repo} in-place direct`")
-    repo_examples.append("`scratch direct`")
-    examples = ", ".join(repo_examples)
-    repos_list = ", ".join(f"`{r}`" for r in sorted(REPOS)) or "(none configured)"
     return (
         f"### {INTAKE_HEAD}\n\n"
         f"Choose workspace & execution mode before `{AGENT.name}` starts (0 tokens used):\n\n"
         f"👉 **[⚙️ Configure & Start]({setup_link(task.id)})**\n\n"
-        f"- **Workspace:** `worktree` *(isolated branch)* or `in-place` *(directly in repo)* for {repos_list}, "
-        "or `scratch` *(standalone folder)*\n"
+        "- **Target:** standalone `scratch` folder *(for new/unrelated tasks)*, or an existing repo with `worktree` *(isolated branch)* / `in-place`\n"
         "- **Mode:** `plan-first` *(spec & numbered Q&A before coding)* or `direct` *(implement right away)*\n\n"
-        f"<sub>or reply with keywords like {examples}, or attach the labels on this card</sub>"
+        "<sub>or reply with keywords like `scratch plan-first`, `<repo> worktree plan-first`, or attach labels on this card</sub>"
     )
 
 
-def apply_intake_selection(task: Task, workspace: str, mode: str) -> str:
-    """Apply workspace (`scratch` or `repo:<name>|worktree|in-place`) and mode (`plan-first`|`direct`)."""
+def apply_intake_selection(task: Task, repo_choice: str, custom_path: str, ws_kind: str, mode: str) -> str:
+    """Apply target repo/scratch, worktree/in-place, and plan-first/direct labels."""
+    repos = discover_repos()
     BOARD.remove_labels(
         task,
         lambda t: t.strip().lower() in (WORKTREE_LABEL, INPLACE_LABEL, SCRATCH_LABEL, PLAN_FIRST_LABEL.lower(), DIRECT_LABEL)
         or t.strip().lower().startswith(REPO_LABEL_PREFIX),
     )
-    if workspace == SCRATCH_LABEL:
+
+    custom_path = (custom_path or "").strip()
+    repo_choice = (repo_choice or "").strip().lower()
+
+    if custom_path:
+        p = Path(custom_path).expanduser().resolve()
+        if not (p.is_dir() and (p / ".git").exists()):
+            raise ValueError(f"Custom path is not a git repository: {custom_path}")
+        if ws_kind not in (WORKTREE_LABEL, INPLACE_LABEL):
+            ws_kind = WORKTREE_LABEL
+        # Use short name if it lives in discover_repos, else full path
+        matched = next((k for k, v in repos.items() if v == p), None)
+        label_val = matched if matched else str(p)
+        BOARD.add_label(task.id, f"{REPO_LABEL_PREFIX}{label_val}", "1e88e5")
+        BOARD.add_label(task.id, ws_kind, LABEL_COLORS[ws_kind])
+        ws_desc = f"{p.name} ({ws_kind})"
+    elif not repo_choice or repo_choice == SCRATCH_LABEL:
         BOARD.add_label(task.id, SCRATCH_LABEL, LABEL_COLORS[SCRATCH_LABEL])
         ws_desc = "scratch"
-    elif workspace.startswith("repo:") and "|" in workspace:
-        repo_part, ws_kind = workspace.split("|", 1)
-        repo_name = repo_part[len("repo:"):].strip().lower()
-        if repo_name not in REPOS or ws_kind not in (WORKTREE_LABEL, INPLACE_LABEL):
-            raise ValueError(f"Invalid workspace selection: {workspace!r}")
-        BOARD.add_label(task.id, f"{REPO_LABEL_PREFIX}{repo_name}", "1e88e5")
-        BOARD.add_label(task.id, ws_kind, LABEL_COLORS[ws_kind])
-        ws_desc = f"{repo_name} ({ws_kind})"
     else:
-        raise ValueError(f"Invalid workspace selection: {workspace!r}")
+        if repo_choice not in repos:
+            raise ValueError(f"Unknown repository: {repo_choice!r}")
+        if ws_kind not in (WORKTREE_LABEL, INPLACE_LABEL):
+            ws_kind = WORKTREE_LABEL
+        BOARD.add_label(task.id, f"{REPO_LABEL_PREFIX}{repo_choice}", "1e88e5")
+        BOARD.add_label(task.id, ws_kind, LABEL_COLORS[ws_kind])
+        ws_desc = f"{repo_choice} ({ws_kind})"
 
     if mode not in (PLAN_FIRST_LABEL, DIRECT_LABEL):
         raise ValueError(f"Invalid execution mode: {mode!r}")
@@ -736,6 +765,7 @@ def apply_intake_selection(task: Task, workspace: str, mode: str) -> str:
 
 def apply_intake_reply(task: Task, pending: list[str]) -> list[str]:
     """Parse intake keywords from user comments on a new card; returns non-config comments."""
+    repos = discover_repos()
     remaining: list[str] = []
     chosen_repo, _ = resolve_repo(task)
     chosen_ws = workspace_mode_of(task)
@@ -756,10 +786,10 @@ def apply_intake_reply(task: Task, pending: list[str]) -> list[str]:
                 chosen_mode, recognized = PLAN_FIRST_LABEL, recognized + 1
             elif tok in (DIRECT_LABEL, "implement", "code", "now"):
                 chosen_mode, recognized = DIRECT_LABEL, recognized + 1
-            elif tok.startswith(REPO_LABEL_PREFIX) and tok[len(REPO_LABEL_PREFIX):] in REPOS:
+            elif tok.startswith(REPO_LABEL_PREFIX) and tok[len(REPO_LABEL_PREFIX):] in repos:
                 chosen_repo = tok[len(REPO_LABEL_PREFIX):]
                 recognized += 1
-            elif tok in REPOS:
+            elif tok in repos:
                 chosen_repo = tok
                 recognized += 1
         if recognized > 0:
@@ -797,6 +827,14 @@ def apply_intake_reply(task: Task, pending: list[str]) -> list[str]:
     return remaining
 
 
+def _guess_repo_from_text(task: Task, repos: dict[str, Path]) -> str | None:
+    haystack = f"{task.title}\n{task.description_text}".lower()
+    for rname in sorted(repos):
+        if re.search(rf"\b{re.escape(rname)}\b", haystack):
+            return rname
+    return None
+
+
 def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple[int, str]:
     q = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
     task_id = q.get("t", "")
@@ -809,43 +847,36 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
         return 409, access_page("Already started", "<p>This card already has an active session.</p>" + back)
 
     if method == "GET":
+        repos = discover_repos()
         cur_repo, _ = resolve_repo(task)
         cur_ws = workspace_mode_of(task)
         cur_mode = execution_mode_of(task) or PLAN_FIRST_LABEL
 
         if cur_ws == SCRATCH_LABEL:
-            default_ws = SCRATCH_LABEL
+            default_repo = ""
         elif cur_repo:
-            default_ws = f"repo:{cur_repo}|{cur_ws or WORKTREE_LABEL}"
-        elif REPOS:
-            default_ws = f"repo:{sorted(REPOS)[0]}|{WORKTREE_LABEL}"
+            default_repo = cur_repo
         else:
-            default_ws = SCRATCH_LABEL
+            default_repo = _guess_repo_from_text(task, repos) or ""
+        default_ws = cur_ws if cur_ws in (WORKTREE_LABEL, INPLACE_LABEL) else WORKTREE_LABEL
+
+        repo_opts = [
+            f'<option value=""{" selected" if not default_repo else ""}>None — new standalone scratch folder</option>'
+        ]
+        for rname, rpath in sorted(repos.items()):
+            sel = " selected" if rname == default_repo else ""
+            repo_opts.append(
+                f'<option value="{html.escape(rname)}"{sel}>{html.escape(rname)} ({html.escape(str(rpath))})</option>'
+            )
 
         ws_radios = []
-        if cur_repo and cur_repo in REPOS:
-            # Repo is already chosen on the card/board: only ask worktree vs in-place for this repo.
-            rpath = REPOS[cur_repo]
-            for kind, desc in [
-                (WORKTREE_LABEL, f"<strong>{html.escape(cur_repo)}</strong> — isolated git worktree <small>(safe for parallel cards)</small>"),
-                (INPLACE_LABEL, f"<strong>{html.escape(cur_repo)}</strong> — in-place <small>({html.escape(str(rpath))})</small>"),
-            ]:
-                val = f"repo:{cur_repo}|{kind}"
-                chk = " checked" if val == default_ws else ""
-                ws_radios.append(f'<label style="display:block;margin:.45rem 0"><input type="radio" name="workspace" value="{html.escape(val)}"{chk}> {desc}</label>')
-        else:
-            for rname, rpath in sorted(REPOS.items()):
-                for kind, desc in [
-                    (WORKTREE_LABEL, f"<strong>{html.escape(rname)}</strong> — isolated git worktree <small>(safe for parallel cards)</small>"),
-                    (INPLACE_LABEL, f"<strong>{html.escape(rname)}</strong> — in-place <small>({html.escape(str(rpath))})</small>"),
-                ]:
-                    val = f"repo:{rname}|{kind}"
-                    chk = " checked" if val == default_ws else ""
-                    ws_radios.append(f'<label style="display:block;margin:.45rem 0"><input type="radio" name="workspace" value="{html.escape(val)}"{chk}> {desc}</label>')
-            chk_s = " checked" if default_ws == SCRATCH_LABEL else ""
+        for kind, desc in [
+            (WORKTREE_LABEL, "<strong>Isolated git worktree</strong> <small>(new branch, safe for parallel cards)</small>"),
+            (INPLACE_LABEL, "<strong>In-place</strong> <small>(directly inside the repo directory)</small>"),
+        ]:
+            chk = " checked" if kind == default_ws else ""
             ws_radios.append(
-                f'<label style="display:block;margin:.45rem 0"><input type="radio" name="workspace" value="scratch"{chk_s}> '
-                "<strong>Scratch folder</strong> <small>(standalone repo in ~/workspace/kanban-tasks/)</small></label>"
+                f'<label style="display:block;margin:.45rem 0"><input type="radio" name="ws_kind" value="{kind}"{chk}> {desc}</label>'
             )
 
         mode_radios = []
@@ -854,13 +885,23 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
             (DIRECT_LABEL, "<strong>Implement directly</strong> <small>(start coding immediately)</small>"),
         ]:
             chk = " checked" if mval == cur_mode else ""
-            mode_radios.append(f'<label style="display:block;margin:.45rem 0"><input type="radio" name="mode" value="{mval}"{chk}> {mdesc}</label>')
+            mode_radios.append(
+                f'<label style="display:block;margin:.45rem 0"><input type="radio" name="mode" value="{mval}"{chk}> {mdesc}</label>'
+            )
 
         body = (
             f"<p><strong>{html.escape(task.title)}</strong></p>"
             '<form method="post">'
             '<fieldset style="border:1px solid #3c4359;border-radius:8px;padding:.8rem 1rem;margin-bottom:1rem">'
-            "<legend>Workspace</legend>"
+            "<legend>Repository</legend>"
+            '<select id="repo" name="repo" style="width:100%;padding:.45rem;border-radius:6px;background:#11141c;color:#e6e6e6;border:1px solid #3c4359">'
+            + "".join(repo_opts)
+            + "</select>"
+            '<input id="custom_path" name="custom_path" placeholder="Or custom git repo path (optional)" '
+            'style="width:100%;box-sizing:border-box;margin-top:.55rem;padding:.45rem;border-radius:6px;background:#11141c;color:#e6e6e6;border:1px solid #3c4359">'
+            "</fieldset>"
+            '<fieldset id="ws_box" style="border:1px solid #3c4359;border-radius:8px;padding:.8rem 1rem;margin-bottom:1rem">'
+            "<legend>Repo Workspace Mode</legend>"
             + "".join(ws_radios)
             + "</fieldset>"
             '<fieldset style="border:1px solid #3c4359;border-radius:8px;padding:.8rem 1rem;margin-bottom:1rem">'
@@ -869,13 +910,22 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
             + "</fieldset>"
             '<button type="submit">Save &amp; Start Agy</button>'
             "</form>"
+            '<script>const r=document.getElementById("repo"),c=document.getElementById("custom_path"),b=document.getElementById("ws_box");'
+            'function sync(){const on=!!(r.value||c.value.trim());b.style.opacity=on?"1":".4";b.disabled=!on;}'
+            'r.addEventListener("change",sync);c.addEventListener("input",sync);sync();</script>'
             + back
         )
         return 200, access_page(f"Configure card #{task.index or task.id}", body)
 
     form = {k: v[0] for k, v in urllib.parse.parse_qs(post_body.decode("utf-8", "replace")).items()}
     try:
-        summary = apply_intake_selection(task, form.get("workspace", ""), form.get("mode", ""))
+        summary = apply_intake_selection(
+            task,
+            form.get("repo", ""),
+            form.get("custom_path", ""),
+            form.get("ws_kind", WORKTREE_LABEL),
+            form.get("mode", ""),
+        )
     except ValueError as e:
         return 400, access_page("Invalid selection", f"<p>{html.escape(str(e))}</p>" + back)
 
@@ -1838,7 +1888,7 @@ def main() -> None:
         TRIGGER_LABEL,
         MAX_CONCURRENT,
         RUN_TIMEOUT,
-        ",".join(sorted(REPOS)) or "none",
+        ",".join(sorted(discover_repos())) or "none",
     )
 
     state = {"reason": "stop", "last_signal": 0.0}
