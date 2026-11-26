@@ -1,0 +1,45 @@
+services:
+  planka-postgres:
+    image: postgres:16-alpine
+    container_name: planka-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5433:5432"
+    env_file:
+      - ~/.config/kanban-bridge/planka.env
+    volumes:
+      - planka_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d planka"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  planka:
+    image: ghcr.io/plankanban/planka:latest
+    container_name: planka
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ~/.config/kanban-bridge/planka.env
+    environment:
+      - HOST=127.0.0.1
+      - PORT=3000
+      - BASE_URL=http://localhost:3000
+      - TRUST_PROXY=false
+      - SWAGGER_EXPOSED=true
+    volumes:
+      - planka_favicons:/app/public/favicons
+      - planka_avatars:/app/public/user-avatars
+      - planka_backgrounds:/app/public/background-images
+      - planka_attachments:/app/private/attachments
+    depends_on:
+      planka-postgres:
+        condition: service_healthy
+
+volumes:
+  planka_db:
+  planka_favicons:
+  planka_avatars:
+  planka_backgrounds:
+  planka_attachments:

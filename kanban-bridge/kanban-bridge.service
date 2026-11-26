@@ -1,0 +1,25 @@
+[Unit]
+Description=Kanban Bridge (Planka <-> Agy headless agent sessions)
+After=network-online.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/kanban-bridge
+EnvironmentFile=%h/.config/kanban-bridge/env
+Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/uv run bridge.py
+
+# Restart on crashes and on exit code 3 (auto-reload when bridge.py/providers change),
+# but stay stopped when explicitly stopped (clean exit 0).
+Restart=on-failure
+RestartForceExitStatus=3
+RestartSec=2
+
+# Send SIGTERM only to the main process so bridge.py can drain running jobs cleanly;
+# escalate to the cgroup only if TimeoutStopSec expires.
+KillMode=mixed
+TimeoutStopSec=180
+
+[Install]
+WantedBy=default.target
