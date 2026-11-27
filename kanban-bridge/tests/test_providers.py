@@ -1231,5 +1231,489 @@ class TestCrossPlatformWorkdirBacklogAndSubagentAudits(unittest.TestCase):
             self.assertAlmostEqual(summary.estimated_cost_usd or 0.0, 0.0855, places=6)
 
 
+class TestOrchestratorMode(unittest.TestCase):
+    def test_is_orchestrator_and_system_prompt(self):
+        import os
+        from providers import Label
+
+        os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+        import bridge
+
+        plain = Task(id="1", title="Normal task", labels=[Label(id="l1", title="direct")])
+        orch = Task(
+            id="2",
+            title="Big refactor",
+            labels=[Label(id="l1", title="direct"), Label(id="l2", title="Orchestrator")],
+        )
+        self.assertFalse(bridge.is_orchestrator(plain))
+        self.assertTrue(bridge.is_orchestrator(orch))
+        self.assertEqual(bridge._default_orchestrator_model("agy", {}), "gemini-pro-orchestrator-neon")
+        self.assertIsNone(bridge._default_orchestrator_model("claude", {}))
+        self.assertEqual(
+            bridge._default_orchestrator_model("agy", {"BRIDGE_ORCHESTRATOR_MODEL": "gemini-pro-orchestrator-argon"}),
+            "gemini-pro-orchestrator-argon",
+        )
+        self.assertIsNone(bridge._default_orchestrator_model("agy", {"BRIDGE_ORCHESTRATOR_MODEL": ""}))
+        self.assertEqual(
+            bridge._default_orchestrator_model("claude", {"BRIDGE_ORCHESTRATOR_MODEL": "opus"}),
+            "opus",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            p_plain = bridge.system_prompt(plain, [], cwd, orchestrator=False)
+            p_orch = bridge.system_prompt(orch, [], cwd, orchestrator=True)
+            self.assertNotIn("ORCHESTRATOR / COORDINATOR MODE IS ACTIVE", p_plain)
+            self.assertIn("ORCHESTRATOR / COORDINATOR MODE IS ACTIVE", p_orch)
+            self.assertIn("`Agent` tool in Claude Code", p_orch)
+            self.assertIn("`swarm` or `invoke_subagent` in Agy", p_orch)
+
+    def test_model_override_for_claude_and_agy(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cwd = tmp_path / "work"
+            cwd.mkdir()
+
+            claude = ClaudeAgent(
+                claude_bin="/usr/local/bin/claude",
+                mode="docker",
+                state_root=tmp_path / "state",
+                model="sonnet",
+                base_env={},
+            )
+            task = Task(id="10", title="Orch card")
+            docker_cmd = claude._build_docker_cmd(
+                task=task,
+                session_id="11111111-2222-3333-4444-555555555555",
+                prompt="Plan and delegate",
+                system_instructions="Be coordinator.",
+                resume=False,
+                cwd=cwd,
+                env_extra={},
+                run_token="tok",
+                tmp_dir=tmp_path,
+                container_name="kanban-task-10-abcd",
+                model_override="opus",
+            )
+            idx = docker_cmd.index("--model")
+            self.assertEqual(docker_cmd[idx + 1], "opus")
+
+            host_cmd = claude._build_host_cmd(
+                session_id="11111111-2222-3333-4444-555555555555",
+                prompt="Plan and delegate",
+                system_instructions="Be coordinator.",
+                resume=False,
+                model_override="opus",
+            )
+            self.assertEqual(host_cmd[host_cmd.index("--model") + 1], "opus")
+
+            agy = AgyAgent(agy_bin="/usr/bin/agy", model="gemini-4-hydrogen-medium", base_env={})
+            captured: dict = {}
+
+            def fake_stream(cmd, **kwargs):
+                captured["cmd"] = cmd
+                captured["default_model"] = kwargs.get("default_model")
+                from providers import AgentResult
+
+                return AgentResult(text="ok", session_id="cid-1", model=kwargs.get("default_model"))
+
+            with mock.patch.object(agy, "_run_streaming", side_effect=fake_stream):
+                res = agy.run_task(
+                    task=task,
+                    session_id=None,
+                    prompt="Plan and delegate",
+                    system_instructions="Be coordinator.",
+                    resume=False,
+                    cwd=cwd,
+                    env_extra={},
+                    on_progress=None,
+                    on_session_id=None,
+                    log_dir=tmp_path,
+                    timeout=60,
+                    procs=set(),
+                    model_override="gemini-4-neon-high",
+                )
+            self.assertEqual(captured["cmd"][captured["cmd"].index("--model") + 1], "gemini-4-neon-high")
+            self.assertEqual(captured["default_model"], "gemini-4-neon-high")
+            self.assertEqual(res.model, "gemini-4-neon-high")
+
+    def test_agy_model_override_falls_back_on_invalid_model_selection(self):
+        from unittest import mock
+        from providers import AgentResult
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cwd = tmp_path / "repo"
+            cwd.mkdir()
+            task = Task(id="card-fb", title="Fallback test")
+            agy = AgyAgent(agy_bin="/usr/bin/agy", model="gemini-4-hydrogen-medium", base_env={})
+            calls: list[tuple[list[str], str | None]] = []
+
+            def fake_stream(cmd, **kwargs):
+                dm = kwargs.get("default_model")
+                calls.append((list(cmd), dm))
+                if dm in ("gemini-pro-orchestrator-neon", "gemini-4-hydrogen-medium"):
+                    return AgentResult(
+                        text=f'⚠️ Agy ended with status `ERROR`:\n\ninvalid model selection (--model "{dm}" --effort "")',
+                        session_id=None,
+                        is_error=True,
+                        model=dm,
+                    )
+                return AgentResult(text="Succeeded on default\nSTATUS: DONE", session_id="cid-ok", is_error=False, model=None)
+
+            with mock.patch.object(agy, "_run_streaming", side_effect=fake_stream):
+                res = agy.run_task(
+                    task=task,
+                    session_id=None,
+                    prompt="Go",
+                    system_instructions="Sys",
+                    resume=False,
+                    cwd=cwd,
+                    env_extra={},
+                    on_progress=None,
+                    on_session_id=None,
+                    log_dir=tmp_path,
+                    timeout=60,
+                    procs=set(),
+                    model_override="gemini-pro-orchestrator-neon",
+                )
+            self.assertFalse(res.is_error)
+            self.assertEqual([dm for _, dm in calls], ["gemini-pro-orchestrator-neon", "gemini-4-hydrogen-medium", None])
+            self.assertNotIn("--model", calls[-1][0])
+
+            # Non-model errors must NOT retry
+            calls.clear()
+
+            def fake_other_error(cmd, **kwargs):
+                calls.append((list(cmd), kwargs.get("default_model")))
+                return AgentResult(text="⚠️ Agy ended with status `ERROR`:\n\nquota exceeded", is_error=True)
+
+            with mock.patch.object(agy, "_run_streaming", side_effect=fake_other_error):
+                res2 = agy.run_task(
+                    task=task,
+                    session_id=None,
+                    prompt="Go",
+                    system_instructions="Sys",
+                    resume=False,
+                    cwd=cwd,
+                    env_extra={},
+                    on_progress=None,
+                    on_session_id=None,
+                    log_dir=tmp_path,
+                    timeout=60,
+                    procs=set(),
+                    model_override="gemini-pro-orchestrator-neon",
+                )
+            self.assertTrue(res2.is_error)
+            self.assertEqual(len(calls), 1)
+
+    def test_agy_ignores_stale_error_on_resumed_completed_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            agent = AgyAgent(agy_bin=sys.executable, base_env={})
+
+            # Case 1: Resumed turn completed final agent_response (state=DONE) cleanly,
+            # but agy's result event still carries a stale ERROR from an earlier turn.
+            stale_events = [
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-resumed",
+                        "step_index": 36,
+                        "state": "ACTIVE",
+                        "step_type": "agent_response",
+                        "text_delta": "Here is the real reply.\nSTATUS: NEEDS_INPUT",
+                    },
+                },
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-resumed",
+                        "step_index": 36,
+                        "state": "DONE",
+                        "step_type": "agent_response",
+                        "text_delta": "\n",
+                    },
+                },
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-resumed",
+                        "status": "ERROR",
+                        "response": "Here is the real reply.\nSTATUS: NEEDS_INPUT\n",
+                        "error": "NOT_FOUND (code 404): Requested entity was not found.",
+                    },
+                },
+            ]
+            fake_cmd_stale = [
+                sys.executable,
+                "-c",
+                "print(" + repr("\n".join(json.dumps(e) for e in stale_events)) + ")",
+            ]
+            res = agent._run_streaming(
+                cmd=fake_cmd_stale,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_dir=tmp_path,
+                known_session_id="conv-resumed",
+            )
+            self.assertFalse(res.is_error)
+            self.assertEqual(res.text, "Here is the real reply.\nSTATUS: NEEDS_INPUT")
+
+            # Case 2: Genuine mid-turn failure (tool ran after text, then crashed with 404).
+            real_err_events = [
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-resumed",
+                        "step_index": 28,
+                        "state": "DONE",
+                        "step_type": "agent_response",
+                        "text_delta": "Checking...",
+                    },
+                },
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-resumed",
+                        "step_index": 29,
+                        "state": "DONE",
+                        "step_type": "tool",
+                        "tool_name": "run_command",
+                    },
+                },
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-resumed",
+                        "status": "ERROR",
+                        "response": "Checking...",
+                        "error": "NOT_FOUND (code 404): Requested entity was not found.",
+                    },
+                },
+            ]
+            fake_cmd_err = [
+                sys.executable,
+                "-c",
+                "print(" + repr("\n".join(json.dumps(e) for e in real_err_events)) + ")",
+            ]
+            res2 = agent._run_streaming(
+                cmd=fake_cmd_err,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_dir=tmp_path,
+                known_session_id="conv-resumed",
+            )
+            self.assertTrue(res2.is_error)
+            self.assertIn("NOT_FOUND (code 404)", res2.text)
+
+
+class TestOpenCodeAgent(unittest.TestCase):
+    def test_load_opencode_provider_and_secret_stripping(self):
+        import os
+        from unittest import mock
+        from providers.opencode import OpenCodeAgent
+
+        fake_os_env = {
+            "PATH": "/usr/bin",
+            "PLANKA_API_KEY": "secret-planka",
+            "WEBHOOK_SECRET": "secret-webhook",
+            "CLAUDE_OAUTH_TOKEN": "secret-claude",
+        }
+        with mock.patch.dict(os.environ, fake_os_env, clear=True):
+            agent = load_agent_provider(
+                "opencode",
+                {
+                    "OPENROUTER_API_KEY": "sk-or-test-key",
+                    "BRIDGE_OPENCODE_MODEL": "openrouter/anthropic/claude-sonnet-4.6",
+                    "BRIDGE_OPENCODE_BIN": "/usr/local/bin/opencode",
+                },
+            )
+        self.assertIsInstance(agent, OpenCodeAgent)
+        self.assertEqual(agent.name, "opencode")
+        self.assertFalse(agent.needs_auth_proxy)
+        self.assertEqual(agent.base_env.get("OPENROUTER_API_KEY"), "sk-or-test-key")
+        for secret in ("PLANKA_API_KEY", "WEBHOOK_SECRET", "CLAUDE_OAUTH_TOKEN"):
+            self.assertNotIn(secret, agent.base_env)
+
+    def test_opencode_streaming_subtasks_audit_and_usage(self):
+        from providers.opencode import AUDIT_PERMISSION_CONFIG, OpenCodeAgent, TASK_PERMISSION_CONFIG
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            events = [
+                {"type": "step_start", "sessionID": "ses_or_123", "part": {"type": "step-start"}},
+                {
+                    "type": "text",
+                    "sessionID": "ses_or_123",
+                    "part": {"type": "text", "text": "Checking tests..."},
+                },
+                {
+                    "type": "tool_use",
+                    "sessionID": "ses_or_123",
+                    "part": {
+                        "id": "prt_1",
+                        "callID": "call_bash_1",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "cargo test"},
+                            "output": "ok",
+                            "title": "Run cargo test",
+                        },
+                    },
+                },
+                {
+                    "type": "tool_use",
+                    "sessionID": "ses_or_123",
+                    "part": {
+                        "id": "prt_2",
+                        "callID": "call_sub_1",
+                        "tool": "task",
+                        "state": {
+                            "status": "completed",
+                            "input": {
+                                "description": "Audit dependencies",
+                                "subagent_type": "research",
+                                "prompt": "Check Cargo.toml",
+                            },
+                            "output": "Found 2 unused crates.",
+                        },
+                    },
+                },
+                {
+                    "type": "tool_use",
+                    "sessionID": "ses_or_123",
+                    "part": {
+                        "id": "prt_3",
+                        "callID": "call_todo_1",
+                        "tool": "todowrite",
+                        "state": {
+                            "status": "completed",
+                            "input": {
+                                "todos": [
+                                    {"content": "Patch provider", "status": "completed"},
+                                    {"content": "Write tests", "status": "in_progress"},
+                                ]
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "step_finish",
+                    "sessionID": "ses_or_123",
+                    "part": {
+                        "type": "step-finish",
+                        "reason": "tool-calls",
+                        "cost": 0.0125,
+                        "tokens": {"input": 5000, "output": 800, "cache": {"read": 2000, "write": 500}},
+                    },
+                },
+                {"type": "step_start", "sessionID": "ses_or_123", "part": {"type": "step-start"}},
+                {
+                    "type": "text",
+                    "sessionID": "ses_or_123",
+                    "part": {"type": "text", "text": "Implemented OpenCode provider.\nSTATUS: DONE\n"},
+                },
+                {
+                    "type": "step_finish",
+                    "sessionID": "ses_or_123",
+                    "part": {
+                        "type": "step-finish",
+                        "reason": "stop",
+                        "cost": 0.0075,
+                        "tokens": {"prompt": 3000, "completion": 400},
+                    },
+                },
+            ]
+            fake_cmd = [
+                sys.executable,
+                "-c",
+                "print(" + repr("\n".join(json.dumps(e) for e in events)) + ")",
+            ]
+            agent = OpenCodeAgent(
+                opencode_bin=sys.executable,
+                model="openrouter/anthropic/claude-sonnet-4.6",
+                base_env={"OPENROUTER_API_KEY": "sk-or-test"},
+            )
+            seen_sids: list[str] = []
+            seen_subtasks: list[tuple[str, str, bool]] = []
+            res = agent._run_streaming(
+                cmd=fake_cmd,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                on_session_id=seen_sids.append,
+                on_subtask=lambda ln, item, done: seen_subtasks.append((ln, item, done)),
+                log_dir=tmp_path,
+                default_model="openrouter/anthropic/claude-sonnet-4.6",
+            )
+            self.assertFalse(res.is_error)
+            self.assertEqual(res.session_id, "ses_or_123")
+            self.assertEqual(seen_sids, ["ses_or_123"])
+            self.assertEqual(res.model, "anthropic/claude-sonnet-4.6")
+            self.assertEqual(res.text, "Implemented OpenCode provider.\nSTATUS: DONE")
+            self.assertIn(("Subagents & Tasks", "[subagent] Audit dependencies (research)", True), seen_subtasks)
+            self.assertIn(("Subagents & Tasks", "Patch provider", True), seen_subtasks)
+            self.assertIn(("Subagents & Tasks", "Write tests", False), seen_subtasks)
+
+            # Audit extraction
+            tools = agent.extract_tool_calls("ses_or_123", tmp_path)
+            self.assertTrue(any("bash: Run cargo test" in t for t in tools))
+            sub_audits = agent.extract_subagent_audits("ses_or_123", tmp_path)
+            self.assertEqual(len(sub_audits), 1)
+            self.assertEqual(sub_audits[0].name, "Audit dependencies (research)")
+            self.assertIn("Found 2 unused crates", sub_audits[0].final_report)
+
+            # Usage & reported cost
+            usage = agent.extract_usage_summary("ses_or_123", tmp_path)
+            self.assertAlmostEqual(usage.reported_cost_usd or 0.0, 0.02, places=6)
+            self.assertEqual(usage.models[0].model, "anthropic/claude-sonnet-4.6")
+            self.assertEqual(usage.models[0].input_tokens, 8000)
+            self.assertEqual(usage.models[0].output_tokens, 1200)
+            self.assertEqual(usage.models[0].cache_read_tokens, 2000)
+            self.assertEqual(usage.models[0].cache_write_tokens, 500)
+
+            # Verify command building and read-only audit config
+            built = agent._build_cmd(
+                "hello",
+                session_id="ses_or_123",
+                resume=True,
+                model="openrouter/google/gemini-2.5-pro",
+                agent_name="build",
+            )
+            self.assertEqual(
+                built,
+                [
+                    sys.executable,
+                    "run",
+                    "--format",
+                    "json",
+                    "--session",
+                    "ses_or_123",
+                    "--model",
+                    "openrouter/google/gemini-2.5-pro",
+                    "--agent",
+                    "build",
+                    "hello",
+                ],
+            )
+            self.assertEqual(json.loads(TASK_PERMISSION_CONFIG)["permission"], "allow")
+            self.assertEqual(json.loads(AUDIT_PERMISSION_CONFIG)["permission"]["*"], "deny")
+            self.assertEqual(json.loads(AUDIT_PERMISSION_CONFIG)["permission"]["read"], "allow")
+
+            # Planka session marker compatibility
+            m = SESSION_TAG_RE.search("Card body\n\n<!-- opencode-session:ses_or_123 -->")
+            self.assertIsNotNone(m)
+            self.assertEqual(m.group(1), "ses_or_123")
+
+
 if __name__ == "__main__":
     unittest.main()

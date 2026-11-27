@@ -32,7 +32,7 @@ from providers import Attachment, BoardProvider, Comment, Label, Task, WebhookEv
 log = logging.getLogger("bridge.planka")
 
 PLANKA_EVENTS = ["cardCreate", "cardUpdate", "cardLabelCreate", "cardLabelDelete", "commentCreate"]
-SESSION_TAG_RE = re.compile(r"\n*<!--\s*(?:agy|claude|kanban)-session:([A-Za-z0-9._-]+)\s*-->\s*$")
+SESSION_TAG_RE = re.compile(r"\n*<!--\s*(?:agy|claude|opencode|kanban)-session:([A-Za-z0-9._-]+)\s*-->\s*$")
 
 # Map bridge hex colors to Planka v2 Label.COLORS
 HEX_TO_PLANKA_COLOR = {
@@ -420,7 +420,7 @@ class PlankaBoard(BoardProvider):
         card = (self._api("GET", f"/cards/{task_id}") or {})["item"]
         desc = (card.get("description") or "").rstrip()
         desc = SESSION_TAG_RE.sub("", desc).rstrip()
-        marker = provider if provider in ("agy", "claude", "kanban") else "kanban"
+        marker = provider if provider in ("agy", "claude", "opencode", "kanban") else "kanban"
         tag = f"<!-- {marker}-session:{session_id} -->"
         new_desc = f"{desc}\n\n{tag}" if desc else tag
         self._api("PATCH", f"/cards/{task_id}", {"description": new_desc}, api_key=self.bot_api_key)

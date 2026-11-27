@@ -47,6 +47,9 @@ $KANBAN create "Task title" --desc "Details..." --list "To-Do"
 # Create a repo-backed, plan-first card (isolated git worktree of clerk, spec/Q&A before coding)
 $KANBAN create "Backtest feature" --desc "Details..." --list "To-Do" --repo clerk --workspace worktree --plan-first
 
+# Create an orchestrator card (agent acts as coordinator, delegating coding & review to subagents)
+$KANBAN create "Multi-module refactor" --desc "Details..." --list "To-Do" --repo clerk --workspace worktree --direct --orchestrator
+
 # Create an in-place or standalone scratch card implementing directly
 $KANBAN create "Quick fix" --desc "Details..." --list "To-Do" --repo clerk --workspace in-place --direct
 $KANBAN create "Scratch note" --desc "Details..." --list "To-Do" --workspace scratch --direct

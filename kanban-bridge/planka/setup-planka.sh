@@ -140,6 +140,7 @@ default_labels = [
     (TRIGGER, "lagoon-blue"),
     ("plan-first", "egg-yellow"),
     ("direct", "sunny-grass"),
+    ("orchestrator", "lilac-eyes"),
     ("worktree", "lagoon-blue"),
     ("in-place", "pumpkin-orange"),
     ("scratch", "muddy-grey"),

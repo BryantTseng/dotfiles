@@ -72,6 +72,19 @@ MAX_CONCURRENT = int(ENV.get("BRIDGE_MAX_CONCURRENT", "2"))
 TRIGGER_LABEL = ENV.get("BRIDGE_TRIGGER_LABEL", "agy")
 PLAN_FIRST_LABEL = ENV.get("BRIDGE_PLAN_FIRST_LABEL", "plan-first")
 DIRECT_LABEL = "direct"
+ORCHESTRATOR_LABEL = ENV.get("BRIDGE_ORCHESTRATOR_LABEL", "orchestrator")
+DEFAULT_AGY_ORCHESTRATOR_MODEL = "gemini-pro-orchestrator-neon"
+
+
+def _default_orchestrator_model(agent_name: str, env: dict[str, str]) -> str | None:
+    if "BRIDGE_ORCHESTRATOR_MODEL" in env:
+        return (env.get("BRIDGE_ORCHESTRATOR_MODEL") or "").strip() or None
+    if (agent_name or "").strip().lower() == "agy":
+        return DEFAULT_AGY_ORCHESTRATOR_MODEL
+    return None
+
+
+ORCHESTRATOR_MODEL = _default_orchestrator_model(AGENT_NAME, ENV)
 WORKTREE_LABEL = "worktree"
 INPLACE_LABEL = "in-place"
 SCRATCH_LABEL = "scratch"
@@ -184,10 +197,36 @@ log = logging.getLogger("bridge")
 # ---------- board helpers ----------
 
 
+def session_id_is_compatible(provider: str, session_id: str) -> bool:
+    """Session IDs belong to the provider that created them.
+
+    OpenCode only accepts IDs starting with ``ses`` (e.g. ``ses_abc123``),
+    while Agy and Claude use UUIDs. After switching ``BRIDGE_AGENT_PROVIDER``,
+    a marker written by the old provider must be treated as *no session* so
+    the new provider starts a fresh one and replaces the marker.
+    """
+    name = (provider or "").strip().lower()
+    if name == "opencode":
+        return session_id.startswith("ses")
+    if name in ("agy", "claude"):
+        return not session_id.startswith("ses")
+    return True
+
+
 def session_of(task: Task) -> str | None:
     for t in task.label_titles:
-        if t.startswith(SESSION_PREFIX):
-            return t[len(SESSION_PREFIX):]
+        if not t.startswith(SESSION_PREFIX):
+            continue
+        sid = t[len(SESSION_PREFIX):]
+        if not session_id_is_compatible(AGENT.name, sid):
+            log.info(
+                "task %s: ignoring session %s (belongs to a different provider than %s)",
+                task.id,
+                sid[:12],
+                AGENT.name,
+            )
+            continue
+        return sid
     return None
 
 
@@ -427,6 +466,10 @@ def is_plan_first(task: Task) -> bool:
     return BOARD.current_bucket(task) == BUCKET_PLANNING
 
 
+def is_orchestrator(task: Task) -> bool:
+    return any(l.strip().lower() == ORCHESTRATOR_LABEL.lower() for l in task.label_titles)
+
+
 def system_prompt(
     task: Task,
     granted: list[str],
@@ -434,6 +477,7 @@ def system_prompt(
     repo_ctx: dict | None = None,
     plan_only: bool = False,
     agent_cwd: Path | None = None,
+    orchestrator: bool = False,
 ) -> str:
     view_cwd = agent_cwd or cwd
     profiles = ", ".join(readonly_aws_profiles()) or "(none found)"
@@ -487,6 +531,21 @@ def system_prompt(
             "numbered list.\n"
             "- Wait for the user to answer your questions or reply `do it` / `proceed` before implementing.\n"
             "- End this turn with `STATUS: NEEDS_INPUT`."
+        )
+
+    if orchestrator:
+        parts.append(
+            "**ORCHESTRATOR / COORDINATOR MODE IS ACTIVE:**\n"
+            "- Act strictly as the **Orchestrator (Coordinator)**: break the task into clear scoped steps, "
+            "delegate implementation, debugging, and verification to subagents (`Agent` tool in Claude Code; "
+            "`swarm` or `invoke_subagent` in Agy), and synthesize the final result.\n"
+            "- Do **NOT** edit production code, run heavy builds, or make multi-file changes directly as the "
+            "Orchestrator — dispatch implementation work to dev subagent(s) and have a separate reviewer "
+            "subagent verify the diff and test results before concluding.\n"
+            "- For trivial read-only lookups or 1–2 command status checks, you may inspect briefly yourself, "
+            "then delegate the actual work.\n"
+            "- If `plan-first` mode is also active, use read-only research subagents to explore the codebase "
+            "and draft the spec/Q&A without editing production code."
         )
 
     parts.append(
@@ -850,7 +909,7 @@ def access_request_block(task_id: str, request_comment_id: str, items: list[str]
     return (
         f"\n\n---\n**{ACCESS_REQUEST_HEAD}** {', '.join(f'`{i}`' for i in items)}\n\n"
         + " · ".join(links)
-        + "\n\n<sub>or reply `approve`, `approve <item>`, `deny`</sub>"
+        + "\n\n*or reply `approve`, `approve <item>`, `deny`*"
     )
 
 
@@ -921,6 +980,7 @@ LABEL_COLORS = {
     SCRATCH_LABEL: "9e9e9e",
     PLAN_FIRST_LABEL: "fbc02d",
     DIRECT_LABEL: "43a047",
+    ORCHESTRATOR_LABEL: "7e57c2",
 }
 
 
@@ -939,17 +999,33 @@ def intake_comment_text(task: Task) -> str:
         f"Choose workspace & execution mode before `{AGENT.name}` starts (0 tokens used):\n\n"
         f"👉 **[⚙️ Configure & Start]({setup_link(task.id)})**\n\n"
         "- **Target:** standalone `scratch` folder *(for new/unrelated tasks)*, or an existing repo with `worktree` *(isolated branch)* / `in-place`\n"
-        "- **Mode:** `plan-first` *(spec & numbered Q&A before coding)* or `direct` *(implement right away)*\n\n"
-        "<sub>or reply with keywords like `scratch plan-first`, `<repo> worktree plan-first`, or attach labels on this card</sub>"
+        "- **Mode:** `plan-first` *(spec & numbered Q&A before coding)* or `direct` *(implement right away)*\n"
+        f"- **Optional:** `{ORCHESTRATOR_LABEL}` *(act as coordinator; delegate coding & review to subagents)*\n\n"
+        "*or reply with keywords like `scratch plan-first`, `<repo> worktree direct orchestrator`, or attach labels on this card*"
     )
 
 
-def apply_intake_selection(task: Task, repo_choice: str, custom_path: str, ws_kind: str, mode: str) -> str:
-    """Apply target repo/scratch, worktree/in-place, and plan-first/direct labels."""
+def apply_intake_selection(
+    task: Task,
+    repo_choice: str,
+    custom_path: str,
+    ws_kind: str,
+    mode: str,
+    orchestrator: bool = False,
+) -> str:
+    """Apply target repo/scratch, worktree/in-place, plan-first/direct, and optional orchestrator labels."""
     repos = discover_repos()
     BOARD.remove_labels(
         task,
-        lambda t: t.strip().lower() in (WORKTREE_LABEL, INPLACE_LABEL, SCRATCH_LABEL, PLAN_FIRST_LABEL.lower(), DIRECT_LABEL)
+        lambda t: t.strip().lower()
+        in (
+            WORKTREE_LABEL,
+            INPLACE_LABEL,
+            SCRATCH_LABEL,
+            PLAN_FIRST_LABEL.lower(),
+            DIRECT_LABEL,
+            ORCHESTRATOR_LABEL.lower(),
+        )
         or t.strip().lower().startswith(REPO_LABEL_PREFIX),
     )
 
@@ -983,6 +1059,9 @@ def apply_intake_selection(task: Task, repo_choice: str, custom_path: str, ws_ki
     if mode not in (PLAN_FIRST_LABEL, DIRECT_LABEL):
         raise ValueError(f"Invalid execution mode: {mode!r}")
     BOARD.add_label(task.id, mode, LABEL_COLORS[mode])
+    if orchestrator:
+        BOARD.add_label(task.id, ORCHESTRATOR_LABEL, LABEL_COLORS[ORCHESTRATOR_LABEL])
+        return f"{ws_desc} · {mode} · {ORCHESTRATOR_LABEL}"
     return f"{ws_desc} · {mode}"
 
 
@@ -993,6 +1072,7 @@ def apply_intake_reply(task: Task, pending: list[str]) -> list[str]:
     chosen_repo, _ = resolve_repo(task)
     chosen_ws = workspace_mode_of(task)
     chosen_mode = execution_mode_of(task)
+    chosen_orch = is_orchestrator(task)
     changed = False
 
     for text in pending:
@@ -1009,6 +1089,8 @@ def apply_intake_reply(task: Task, pending: list[str]) -> list[str]:
                 chosen_mode, recognized = PLAN_FIRST_LABEL, recognized + 1
             elif tok in (DIRECT_LABEL, "implement", "code", "now"):
                 chosen_mode, recognized = DIRECT_LABEL, recognized + 1
+            elif tok in (ORCHESTRATOR_LABEL.lower(), "orch", "coordinator"):
+                chosen_orch, recognized = True, recognized + 1
             elif tok.startswith(REPO_LABEL_PREFIX) and tok[len(REPO_LABEL_PREFIX):] in repos:
                 chosen_repo = tok[len(REPO_LABEL_PREFIX):]
                 recognized += 1
@@ -1046,7 +1128,16 @@ def apply_intake_reply(task: Task, pending: list[str]) -> list[str]:
             other_m = DIRECT_LABEL if chosen_mode == PLAN_FIRST_LABEL else PLAN_FIRST_LABEL
             BOARD.remove_labels(task, lambda t: t.strip().lower() == other_m.lower())
             BOARD.add_label(task.id, chosen_mode, LABEL_COLORS[chosen_mode])
-        log.info("task %s: applied intake reply (repo=%s ws=%s mode=%s)", task.id, chosen_repo, chosen_ws, chosen_mode)
+        if chosen_orch:
+            BOARD.add_label(task.id, ORCHESTRATOR_LABEL, LABEL_COLORS[ORCHESTRATOR_LABEL])
+        log.info(
+            "task %s: applied intake reply (repo=%s ws=%s mode=%s orchestrator=%s)",
+            task.id,
+            chosen_repo,
+            chosen_ws,
+            chosen_mode,
+            chosen_orch,
+        )
     return remaining
 
 
@@ -1074,6 +1165,7 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
         cur_repo, _ = resolve_repo(task)
         cur_ws = workspace_mode_of(task)
         cur_mode = execution_mode_of(task) or PLAN_FIRST_LABEL
+        cur_orch = is_orchestrator(task)
 
         if cur_ws == SCRATCH_LABEL:
             default_repo = ""
@@ -1112,6 +1204,7 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
                 f'<label style="display:block;margin:.45rem 0"><input type="radio" name="mode" value="{mval}"{chk}> {mdesc}</label>'
             )
 
+        orch_chk = " checked" if cur_orch else ""
         body = (
             f"<p><strong>{html.escape(task.title)}</strong></p>"
             '<form method="post">'
@@ -1130,6 +1223,9 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
             '<fieldset style="border:1px solid #3c4359;border-radius:8px;padding:.8rem 1rem;margin-bottom:1rem">'
             "<legend>Execution Mode</legend>"
             + "".join(mode_radios)
+            + f'<hr style="border:0;border-top:1px solid #3c4359;margin:.65rem 0">'
+            + f'<label style="display:block;margin:.45rem 0"><input type="checkbox" name="orchestrator" value="1"{orch_chk}> '
+            + "<strong>Orchestrator mode</strong> <small>(act as coordinator; delegate coding &amp; review to subagents)</small></label>"
             + "</fieldset>"
             + f'<button type="submit">Save &amp; Start {html.escape(AGENT.name.capitalize())}</button>'
             "</form>"
@@ -1148,6 +1244,7 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
             form.get("custom_path", ""),
             form.get("ws_kind", WORKTREE_LABEL),
             form.get("mode", ""),
+            orchestrator=form.get("orchestrator") == "1",
         )
     except ValueError as e:
         return 400, access_page("Invalid selection", f"<p>{html.escape(str(e))}</p>" + back)
@@ -1526,6 +1623,7 @@ def run_task(
                     extra_env = dict(creds_env)
                     if repo_ctx and SHARE_CARGO_TARGET and (cwd / "Cargo.toml").exists():
                         extra_env.setdefault("CARGO_TARGET_DIR", str(repo_ctx["repo_path"] / "target"))
+                    orch = is_orchestrator(task)
                     result = AGENT.run_task(
                         task=task,
                         session_id=session_id,
@@ -1537,6 +1635,7 @@ def run_task(
                             repo_ctx=repo_ctx,
                             plan_only=plan_only,
                             agent_cwd=agent_cwd,
+                            orchestrator=orch,
                         ),
                         resume=resume,
                         cwd=cwd,
@@ -1547,6 +1646,7 @@ def run_task(
                         timeout=RUN_TIMEOUT,
                         procs=_procs,
                         on_subtask=on_subtask,
+                        model_override=ORCHESTRATOR_MODEL if orch else None,
                     )
             finally:
                 subtask_q.put(None)
@@ -1608,7 +1708,7 @@ def run_task(
 
     if FORCE.is_set():
         if git_footer:
-            reply += f"\n\n<sub>{git_footer}</sub>"
+            reply += f"\n\n*{git_footer}*"
         BOARD.publish(task_id, placeholder.id, reply)
         BOARD.move_to(task, BUCKET_NEEDS_ACTION)
         log.info("task %s: interrupted by forced stop (%s)", task_id, git_footer)
@@ -1663,7 +1763,7 @@ def run_task(
             reply += "\n\n⚠️ Could not attach: " + "; ".join(attach_errors)
 
     if git_footer:
-        reply += f"\n\n<sub>{git_footer}</sub>"
+        reply += f"\n\n*{git_footer}*"
     BOARD.publish(task_id, placeholder.id, reply)
 
     if status == "DONE":
@@ -1884,7 +1984,7 @@ def audit_task(
     for f in flags:
         BOARD.add_label(task.id, FLAG_PREFIX + f, FLAG_COLOR)
     for mu in usage_summary.models:
-        if mu.model and mu.model not in ("agy", "claude"):
+        if mu.model and mu.model not in ("agy", "claude", "opencode"):
             mlbl = f"{MODEL_LABEL_PREFIX}{mu.model}"
             if mlbl not in task.label_titles:
                 try:

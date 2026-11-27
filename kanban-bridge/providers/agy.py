@@ -131,6 +131,7 @@ class AgyAgent(AgentProvider):
         on_subtask: Callable[[str, str, bool], None] | None = None,
         log_dir: Path | None = None,
         known_session_id: str | None = None,
+        default_model: str | None = None,
     ) -> AgentResult:
         buffered_lines: list[str] = []
         session_id = known_session_id
@@ -184,7 +185,9 @@ class AgyAgent(AgentProvider):
             last_step: str | None = None
             result_payload: dict | None = None
             step_texts: dict[int, list[str]] = {}
+            completed_text_steps: set[int] = set()
             last_text_step: int | None = None
+            max_step_index: int = -1
             subtask_lock = threading.Lock()
             open_subtasks: dict[str, bool] = {}  # item_text -> is_completed
             failed_subtasks: set[str] = set()
@@ -351,11 +354,16 @@ class AgyAgent(AgentProvider):
                                     for lbl in list(open_subtasks):
                                         if lbl.startswith("[subagent]") and not open_subtasks[lbl]:
                                             track_subtask(lbl, True)
-                        elif step_type == "agent_response" and su.get("text_delta"):
-                            delta = su["text_delta"]
-                            step_texts.setdefault(sidx, []).append(delta)
-                            if delta.strip():
-                                last_text_step = sidx
+                        elif step_type == "agent_response":
+                            if su.get("text_delta"):
+                                delta = su["text_delta"]
+                                step_texts.setdefault(sidx, []).append(delta)
+                                if delta.strip():
+                                    last_text_step = sidx
+                            if isinstance(sidx, int) and str(su.get("state") or "").upper() == "DONE":
+                                completed_text_steps.add(sidx)
+                        if isinstance(sidx, int) and sidx > max_step_index:
+                            max_step_index = sidx
                     elif ev_type == "result":
                         result_payload = ev.get("result") or ev
                         cid = result_payload.get("conversation_id")
@@ -384,7 +392,7 @@ class AgyAgent(AgentProvider):
             if timed_out.is_set():
                 raise subprocess.TimeoutExpired(cmd, timeout)
 
-            detected_model = self._detect_model(session_id) or self.model
+            detected_model = self._detect_model(session_id) or default_model or self.model
 
             if result_payload is None:
                 err.seek(0)
@@ -397,18 +405,43 @@ class AgyAgent(AgentProvider):
                 )
 
             status = str(result_payload.get("status") or "SUCCESS").upper()
+            # Use only the final agent_response step so intermediate background-wait chatter
+            # (e.g. "Running cargo test... waiting for build to finish.") doesn't pollute the reply.
+            final_step_text = "".join(step_texts.get(last_text_step, [])).strip() if last_text_step is not None else ""
+            result_response = (result_payload.get("response") or "").strip()
+            text = final_step_text or result_response
+            denied = result_payload.get("denied_actions") or []
+            err_msg = result_payload.get("error")
+
+            # Workaround for an `agy --conversation` stream-json quirk: once an earlier turn
+            # in a conversation fails, subsequent resumed turns can still emit status="ERROR"
+            # with the stale error string even after the new turn streams a completed final
+            # agent_response (state="DONE") and populates result.response.
+            if (
+                status != "SUCCESS"
+                and known_session_id
+                and last_text_step is not None
+                and last_text_step in completed_text_steps
+                and last_text_step == max_step_index
+                and final_step_text
+                and result_response
+            ):
+                log.warning(
+                    "ignoring stale agy result status=%s on resumed session %s "
+                    "(final agent_response step %d completed cleanly): %s",
+                    status,
+                    session_id or known_session_id,
+                    last_text_step,
+                    err_msg,
+                )
+                status = "SUCCESS"
+
             if status == "SUCCESS":
                 # Any subagents, swarm workers, workflows, or background tasks launched during
                 # a clean turn have finished by the time the turn ends; mark non-failed ones checked.
                 for lbl, is_done in list(open_subtasks.items()):
                     if not is_done and lbl not in failed_subtasks:
                         track_subtask(lbl, True)
-            # Use only the final agent_response step so intermediate background-wait chatter
-            # (e.g. "Running cargo test... waiting for build to finish.") doesn't pollute the reply.
-            final_step_text = "".join(step_texts.get(last_text_step, [])).strip() if last_text_step is not None else ""
-            text = final_step_text or (result_payload.get("response") or "").strip()
-            denied = result_payload.get("denied_actions") or []
-            err_msg = result_payload.get("error")
 
             if status != "SUCCESS":
                 detail = err_msg or text or "(no details)"
@@ -448,6 +481,7 @@ class AgyAgent(AgentProvider):
         timeout: int,
         procs: set,
         on_subtask: Callable[[str, str, bool], None] | None = None,
+        model_override: str | None = None,
     ) -> AgentResult:
         if resume:
             full_prompt = (
@@ -460,7 +494,7 @@ class AgyAgent(AgentProvider):
                 f"{prompt}"
             )
 
-        cmd = [
+        base_cmd = [
             self.agy_bin,
             "-p",
             full_prompt,
@@ -470,13 +504,17 @@ class AgyAgent(AgentProvider):
             "--dangerously-skip-permissions",
         ]
         if self.disable_slash_commands:
-            cmd.append("--disable-slash-commands")
+            base_cmd.append("--disable-slash-commands")
         if resume and session_id:
-            cmd += ["--conversation", session_id]
-        if self.model:
-            cmd += ["--model", self.model]
-        if self.effort:
-            cmd += ["--effort", self.effort]
+            base_cmd += ["--conversation", session_id]
+
+        # Build deduplicated model fallback chain so transient backend model-list
+        # degradation (e.g. orchestrator model temporarily unrecognized) falls back
+        # cleanly instead of failing the card.
+        model_candidates: list[str | None] = []
+        for candidate in (model_override, self.model, None):
+            if candidate not in model_candidates:
+                model_candidates.append(candidate)
 
         env = {**self.base_env, "GIT_TERMINAL_PROMPT": "0", **env_extra}
         log.info(
@@ -485,18 +523,43 @@ class AgyAgent(AgentProvider):
             f"resume {session_id[:8]}" if resume and session_id else "new",
             cwd,
         )
-        return self._run_streaming(
-            cmd=cmd,
-            cwd=cwd,
-            env=env,
-            timeout=timeout,
-            procs=procs,
-            on_progress=on_progress,
-            on_session_id=on_session_id,
-            on_subtask=on_subtask,
-            log_dir=log_dir,
-            known_session_id=session_id if resume else None,
-        )
+        res: AgentResult | None = None
+        for idx, effective_model in enumerate(model_candidates):
+            cmd = list(base_cmd)
+            if effective_model:
+                cmd += ["--model", effective_model]
+            if self.effort:
+                cmd += ["--effort", self.effort]
+            res = self._run_streaming(
+                cmd=cmd,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                procs=procs,
+                on_progress=on_progress,
+                on_session_id=on_session_id,
+                on_subtask=on_subtask,
+                log_dir=log_dir,
+                known_session_id=session_id if resume else None,
+                default_model=effective_model,
+            )
+            if (
+                effective_model
+                and res.is_error
+                and "invalid model selection" in res.text.lower()
+                and idx + 1 < len(model_candidates)
+            ):
+                next_model = model_candidates[idx + 1]
+                log.warning(
+                    "task %s: agy rejected --model %r; retrying with %s",
+                    task.id,
+                    effective_model,
+                    repr(next_model) if next_model else "default model",
+                )
+                continue
+            return res
+        assert res is not None
+        return res
 
     def run_audit(
         self,

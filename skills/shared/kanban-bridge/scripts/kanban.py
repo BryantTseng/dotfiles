@@ -20,7 +20,7 @@ import urllib.request
 from pathlib import Path
 
 ENV_PATH = Path.home() / ".config/kanban-bridge/env"
-SESSION_TAG_RE = re.compile(r"\n*<!--\s*(?:agy|claude|kanban)-session:([A-Za-z0-9._-]+)\s*-->\s*$")
+SESSION_TAG_RE = re.compile(r"\n*<!--\s*(?:agy|claude|opencode|kanban)-session:([A-Za-z0-9._-]+)\s*-->\s*$")
 APPROVE_RE = re.compile(r"^\s*(approve|deny)\b", re.I)
 
 
@@ -283,6 +283,9 @@ def cmd_create(cli: PlankaClient, args) -> None:
     elif args.direct:
         ensure_and_attach("direct", "sunny-grass")
         attached.append("direct")
+    if args.orchestrator:
+        ensure_and_attach("orchestrator", "lilac-eyes")
+        attached.append("orchestrator")
     if args.trigger:
         ensure_and_attach(cli.trigger_label, "lagoon-blue")
         attached.append(cli.trigger_label)
@@ -475,6 +478,7 @@ def main() -> None:
     )
     p_create.add_argument("--plan-first", action="store_true", help="Attach plan-first label (spec/Q&A before coding)")
     p_create.add_argument("--direct", action="store_true", help="Attach direct label (start coding immediately)")
+    p_create.add_argument("--orchestrator", action="store_true", help="Attach orchestrator label (coordinator mode: delegate coding & review to subagents)")
     p_create.add_argument("--trigger", action="store_true", help="Attach the configured trigger label to start a run")
 
     p_move = sub.add_parser("move", help="Move a card to a column by name")

@@ -227,6 +227,7 @@ class ClaudeAgent(AgentProvider):
         log_path: Path | None = None,
         container: str | None = None,
         session_id: str | None = None,
+        default_model: str | None = None,
     ) -> AgentResult:
         log_file = None
         if log_path:
@@ -270,7 +271,7 @@ class ClaudeAgent(AgentProvider):
             steps = 0
             last_step: str | None = None
             result_ev: dict | None = None
-            detected_model: str | None = self.model
+            detected_model: str | None = default_model or self.model
             subagent_by_id: dict[str, str] = {}  # tool_use_id -> item label
             subtask_state: dict[str, bool] = {}  # item_text -> is_completed
             stop_ticker = threading.Event()
@@ -397,6 +398,7 @@ class ClaudeAgent(AgentProvider):
         run_token: str,
         tmp_dir: Path,
         container_name: str,
+        model_override: str | None = None,
     ) -> list[str]:
         container_workdir, work_mounts = _worktree_git_mount(cwd)
         state_dir = self._claude_state_dir(task, session_id, container_workdir)
@@ -449,8 +451,9 @@ class ClaudeAgent(AgentProvider):
             "--append-system-prompt",
             system_instructions,
         ]
-        if self.model:
-            cmd += ["--model", self.model]
+        effective_model = model_override or self.model
+        if effective_model:
+            cmd += ["--model", effective_model]
         cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
         return cmd
 
@@ -460,6 +463,7 @@ class ClaudeAgent(AgentProvider):
         prompt: str,
         system_instructions: str,
         resume: bool,
+        model_override: str | None = None,
     ) -> list[str]:
         cmd = [
             self.claude_bin,
@@ -475,8 +479,9 @@ class ClaudeAgent(AgentProvider):
             "--append-system-prompt",
             system_instructions,
         ]
-        if self.model:
-            cmd += ["--model", self.model]
+        effective_model = model_override or self.model
+        if effective_model:
+            cmd += ["--model", effective_model]
         cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
         return cmd
 
@@ -495,15 +500,17 @@ class ClaudeAgent(AgentProvider):
         timeout: int,
         procs: set,
         on_subtask: Callable[[str, str, bool], None] | None = None,
+        model_override: str | None = None,
     ) -> AgentResult:
         sid = session_id or str(uuid.uuid4())
         if not resume and on_session_id:
             on_session_id(sid)
 
         log_path = log_dir / f"{sid}.jsonl"
+        effective_model = model_override or self.model
 
         if self.mode == "host":
-            cmd = self._build_host_cmd(sid, prompt, system_instructions, resume)
+            cmd = self._build_host_cmd(sid, prompt, system_instructions, resume, model_override=effective_model)
             env = {**self.base_env, "GIT_TERMINAL_PROMPT": "0", **env_extra}
             log.info("task %s: running claude (host, %s) in %s", task.id, "resume" if resume else "new", cwd)
             return self._run_streaming(
@@ -516,6 +523,7 @@ class ClaudeAgent(AgentProvider):
                 on_subtask=on_subtask,
                 log_path=log_path,
                 session_id=sid,
+                default_model=effective_model,
             )
 
         run_token = secrets.token_urlsafe(32)
@@ -532,6 +540,7 @@ class ClaudeAgent(AgentProvider):
                 run_token=run_token,
                 tmp_dir=Path(tmp),
                 container_name=container,
+                model_override=effective_model,
             )
             log.info(
                 "task %s: running claude (docker:%s, %s) in %s",
@@ -553,6 +562,7 @@ class ClaudeAgent(AgentProvider):
                     log_path=log_path,
                     container=container,
                     session_id=sid,
+                    default_model=effective_model,
                 )
             finally:
                 unregister_proxy_token(run_token)

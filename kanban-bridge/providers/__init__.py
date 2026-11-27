@@ -502,6 +502,7 @@ class AgentProvider(ABC):
         timeout: int,
         procs: set,
         on_subtask: Callable[[str, str, bool], None] | None = None,
+        model_override: str | None = None,
     ) -> AgentResult:
         """Run one agent turn on `task` inside `cwd`."""
 
@@ -561,4 +562,8 @@ def load_agent_provider(name: str, env: dict[str, str]) -> AgentProvider:
         from providers.claude import ClaudeAgent
 
         return ClaudeAgent.from_env(env)
-    raise ValueError(f"Unknown agent provider {name!r}. Supported: agy, claude")
+    if key == "opencode":
+        from providers.opencode import OpenCodeAgent
+
+        return OpenCodeAgent.from_env(env)
+    raise ValueError(f"Unknown agent provider {name!r}. Supported: agy, claude, opencode")
