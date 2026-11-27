@@ -45,7 +45,15 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from providers import AgentProvider, BoardProvider, Comment, Task, load_agent_provider, load_board_provider
+from providers import (
+    AgentProvider,
+    BoardProvider,
+    Comment,
+    Task,
+    is_valid_proxy_token,
+    load_agent_provider,
+    load_board_provider,
+)
 
 ENV = dict(os.environ)
 
@@ -908,7 +916,7 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
             "<legend>Execution Mode</legend>"
             + "".join(mode_radios)
             + "</fieldset>"
-            '<button type="submit">Save &amp; Start Agy</button>'
+            + f'<button type="submit">Save &amp; Start {html.escape(AGENT.name.capitalize())}</button>'
             "</form>"
             '<script>const r=document.getElementById("repo"),c=document.getElementById("custom_path"),b=document.getElementById("ws_box");'
             'function sync(){const on=!!(r.value||c.value.trim());b.style.opacity=on?"1":".4";b.disabled=!on;}'
@@ -938,7 +946,7 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
     enqueue(task_id)
     return 200, access_page(
         f"Configured: {summary}",
-        "<p>Agy is starting now. You can close this tab.</p>" + back,
+        f"<p>{html.escape(AGENT.name.capitalize())} is starting now. You can close this tab.</p>" + back,
     )
 
 
@@ -1134,10 +1142,7 @@ def first_paragraph(md_text: str) -> str:
     return text.split("\n\n")[0][:400]
 
 
-# ---------- optional auth proxy (for future containerized providers) ----------
-
-_run_tokens: dict[str, str] = {}
-_run_tokens_lock = threading.Lock()
+# ---------- auth proxy (for containerized providers like ClaudeAgent) ----------
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -1147,9 +1152,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _proxy(self):
         auth = self.headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ").strip() or self.headers.get("x-api-key", "")
-        with _run_tokens_lock:
-            ok = token in _run_tokens
-        if not ok or not CLAUDE_OAUTH_TOKEN:
+        if not is_valid_proxy_token(token) or not CLAUDE_OAUTH_TOKEN:
             self.send_response(401)
             self.send_header("Content-Length", "0")
             self.end_headers()

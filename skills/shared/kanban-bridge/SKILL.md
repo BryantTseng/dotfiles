@@ -11,7 +11,7 @@ description: >-
 
 # Kanban Bridge (`~/workspace/kanban-bridge/`)
 
-Self-hosted **Planka v2** board (live WebSockets + PostgreSQL) bridged to headless `agy --sandbox` sessions via pluggable `BoardProvider` and `AgentProvider` interfaces.
+Self-hosted **Planka v2** board (live WebSockets + PostgreSQL) bridged to headless **`agy --sandbox`** or **Claude Code (`claude`)** sessions via pluggable `BoardProvider` and `AgentProvider` interfaces (`BRIDGE_AGENT_PROVIDER=agy|claude`).
 
 ## Critical Safety Rules
 
