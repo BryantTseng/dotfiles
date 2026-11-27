@@ -22,7 +22,7 @@ from providers import (
 )
 from providers.agy import AgyAgent
 from providers.claude import ClaudeAgent, _worktree_git_mount
-from providers.planka import PlankaBoard, SESSION_TAG_RE
+from providers.planka import PlankaBoard, SESSION_TAG_RE, _encode_multipart
 
 
 class TestProviderLoadingAndRegistry(unittest.TestCase):
@@ -509,6 +509,74 @@ class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
         for no_msg in ("done with step 1, now add tests", "not done yet", "close the modal after click"):
             self.assertIsNone(bridge.DONE_CMD_RE.match(no_msg), f"should NOT match: {no_msg!r}")
 
+    def test_extract_attachments_and_path_validation(self):
+        import os
+        os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+        import bridge
+
+        raw = (
+            "Here is the chart and example:\n\n"
+            "```markdown\n"
+            "ATTACH: example_inside_code_block.png\n"
+            "```\n\n"
+            "ATTACH: `out/diagram.png` | Architecture Diagram\n"
+            "ATTACH: report.txt\n"
+            "All done."
+        )
+        cleaned, specs = bridge.extract_attachments(raw)
+        self.assertEqual(
+            specs,
+            [
+                ("out/diagram.png", "Architecture Diagram"),
+                ("report.txt", None),
+            ],
+        )
+        self.assertIn("ATTACH: example_inside_code_block.png", cleaned)
+        self.assertNotIn("ATTACH: report.txt", cleaned)
+        self.assertIn("All done.", cleaned)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            cwd = root / "task"
+            (cwd / "out").mkdir(parents=True)
+            (cwd / ".git").mkdir()
+            ok_file = cwd / "out" / "diagram.png"
+            ok_file.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+            env_file = cwd / ".env"
+            env_file.write_text("SECRET=1", encoding="utf-8")
+            pem_file = cwd / "private.pem"
+            pem_file.write_text("key", encoding="utf-8")
+            git_file = cwd / ".git" / "config"
+            git_file.write_text("git", encoding="utf-8")
+            outside = root / "outside.txt"
+            outside.write_text("nope", encoding="utf-8")
+
+            res, err = bridge.resolve_attachable_path("out/diagram.png", cwd)
+            self.assertIsNone(err)
+            self.assertEqual(res, ok_file)
+
+            res, err = bridge.resolve_attachable_path(f"file://{ok_file}", cwd)
+            self.assertIsNone(err)
+            self.assertEqual(res, ok_file)
+
+            for bad in ("../outside.txt", ".env", "private.pem", ".git/config", "missing.png"):
+                res, err = bridge.resolve_attachable_path(bad, cwd)
+                self.assertIsNone(res, f"should reject {bad}")
+                self.assertIsNotNone(err)
+
+        body, ctype = _encode_multipart(
+            fields=[("type", "file"), ("name", "chart.png")],
+            file_field="file",
+            filename="chart.png",
+            content_type="image/png",
+            data=b"\x89PNGDATA",
+        )
+        self.assertIn("multipart/form-data; boundary=", ctype)
+        # Sails/Skipper requires text fields before file payload
+        self.assertLess(body.index(b'name="type"'), body.index(b'name="file"'))
+        self.assertLess(body.index(b'name="name"'), body.index(b'name="file"'))
+        self.assertIn(b"\x89PNGDATA", body)
+
 
 class TestPlankaSessionTagCompat(unittest.TestCase):
     def test_session_tag_matches_agy_claude_and_kanban(self):
@@ -562,6 +630,54 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
         self.assertIsNotNone(human_ev)
         assert human_ev is not None
         self.assertEqual(human_ev.task_id, "c1")
+
+    def test_planka_upload_attachment_url_and_headers(self):
+        import io
+        from unittest import mock
+
+        board = PlankaBoard(
+            base_url="http://127.0.0.1:3000",
+            api_key="admin-key",
+            webhook_url="http://127.0.0.1:8787/planka",
+            webhook_secret="sec",
+            bot_api_key="bot-key",
+            bot_username="agy",
+        )
+        seen_req = []
+
+        class _FakeResp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=60):
+            seen_req.append(req)
+            return _FakeResp(
+                json.dumps(
+                    {
+                        "item": {
+                            "id": "att1",
+                            "name": "Badge",
+                            "type": "file",
+                            "data": {"url": "http://localhost:3000/attachments/att1/download/badge.png", "mimeType": "image/png", "sizeInBytes": 8, "image": {"width": 1, "height": 1}},
+                        }
+                    }
+                ).encode()
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "badge.png"
+            p.write_bytes(b"\x89PNGDATA")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                att = board.upload_attachment("c1", p, name="Badge")
+            self.assertIsNotNone(att)
+            assert att is not None
+            self.assertEqual(att.id, "att1")
+            self.assertTrue(att.is_image)
+            self.assertEqual(seen_req[0].full_url, "http://127.0.0.1:3000/api/cards/c1/attachments")
+            self.assertEqual(seen_req[0].headers.get("X-api-key"), "bot-key")
 
 
 if __name__ == "__main__":

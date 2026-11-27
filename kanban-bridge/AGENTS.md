@@ -15,7 +15,7 @@ Operational notes for AI agents (`agy`, `claudecode`, etc.) working in this repo
 - **Done & Audit policy:** Cards **never** move to **Done** automatically — finished runs and clean audits land in **Pending** until the user drags the card to **Done** or comments `done` / `mark done` / `move to done` / `close` (0 tokens). Audits run **only** when the user explicitly moves a card into **Auditing**.
 
 ## Architecture
-- `bridge.py`: Core orchestrator (queueing, 2-slot cap, `/setup` intake, `plan-first` gate, git worktrees, access flow, notifications, auth proxy, graceful/forced shutdown, auto-reload via exit code `3`).
+- `bridge.py`: Core orchestrator (queueing, 2-slot cap, `/setup` intake, `plan-first` gate, git worktrees, two-way Planka attachment sync, access flow, notifications, auth proxy, graceful/forced shutdown, auto-reload via exit code `3`).
 - `providers/__init__.py`: `BoardProvider` and `AgentProvider` interfaces, loader (`planka`, `agy`, `claude`), and proxy token registry.
 - `providers/planka.py`: Planka v2 backend (live WebSocket UI, `X-Api-Key`, board `editor` bot user `agy` for moves/checklists/labels/comments, invisible description session tag, webhooks).
 - `providers/agy.py`: Host `agy --sandbox` backend (`stream-json`, immediate session capture, live `Subagents & Tasks` checklist emission for `invoke_subagent`/`swarm`/`run_workflow`/backgrounded `run_command`, host audit log, read-only `--mode plan` auditor).

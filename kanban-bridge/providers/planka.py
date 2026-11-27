@@ -17,13 +17,17 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import mimetypes
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Callable
 
-from providers import BoardProvider, Comment, Label, Task, WebhookEvent
+from providers import Attachment, BoardProvider, Comment, Label, Task, WebhookEvent
 
 log = logging.getLogger("bridge.planka")
 
@@ -51,6 +55,42 @@ def _planka_color(color: str) -> str:
     if "-" in c:
         return c  # already a Planka named color
     return "lagoon-blue"
+
+
+def _safe_filename(name: str, fallback: str = "file") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip()).strip("._")
+    return cleaned[:100] or fallback
+
+
+def _encode_multipart(
+    fields: list[tuple[str, str]],
+    file_field: str,
+    filename: str,
+    content_type: str,
+    data: bytes,
+) -> tuple[bytes, str]:
+    """Build a multipart/form-data body with text fields first (required by Sails/Skipper)."""
+    boundary = f"----KanbanBridge{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for key, val in fields:
+        chunks.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                f"{val}\r\n"
+            ).encode("utf-8")
+        )
+    safe_fn = filename.replace('"', "_").replace("\r", "").replace("\n", "")
+    chunks.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{safe_fn}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    chunks.append(data)
+    chunks.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
 class PlankaBoard(BoardProvider):
@@ -495,6 +535,142 @@ class PlankaBoard(BoardProvider):
                     api_key=self.bot_api_key,
                 )["item"]
                 by_norm[name.lower()] = created
+
+    def _rewrite_local_url(self, raw_url: str) -> str:
+        """Rewrite a Planka attachment URL onto self.base_url (preserving path & query)."""
+        parsed = urllib.parse.urlparse(raw_url)
+        if not parsed.path:
+            return raw_url
+        base = urllib.parse.urlparse(self.base_url)
+        return urllib.parse.urlunparse(
+            (base.scheme, base.netloc, parsed.path, parsed.params, parsed.query, "")
+        )
+
+    def sync_attachments_in(
+        self, task_id: str, dest_dir: Path, max_bytes: int = 25 * 1024 * 1024
+    ) -> list[Attachment]:
+        """Download Planka card file attachments into `dest_dir` and return attachment metadata."""
+        data = self._api("GET", f"/cards/{task_id}") or {}
+        raw_atts = (data.get("included") or {}).get("attachments") or []
+        if not raw_atts:
+            return []
+
+        results: list[Attachment] = []
+        for att in raw_atts:
+            aid = str(att.get("id") or "")
+            name = str(att.get("name") or "attachment").strip() or "attachment"
+            kind = str(att.get("type") or "file").lower()
+            adata = att.get("data") or {}
+            url = str(adata.get("url") or "")
+            if kind == "link":
+                results.append(Attachment(id=aid, name=name, kind="link", url=url))
+                continue
+            if kind != "file" or not url:
+                continue
+
+            size_bytes = int(adata.get("sizeInBytes") or 0)
+            mime_type = str(adata.get("mimeType") or "")
+            is_image = bool(adata.get("image")) or mime_type.startswith("image/")
+            if size_bytes > max_bytes:
+                log.warning("card %s: skipping attachment %s (%s, %d bytes > limit)", task_id, aid, name, size_bytes)
+                results.append(
+                    Attachment(
+                        id=aid,
+                        name=name,
+                        kind="file",
+                        url=url,
+                        mime_type=mime_type,
+                        size_bytes=size_bytes,
+                        is_image=is_image,
+                        local_path=None,
+                    )
+                )
+                continue
+
+            # Preserve extension from download URL or display name so viewers detect images/PDFs
+            url_name = Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name
+            ext = Path(url_name).suffix or Path(name).suffix
+            base_stem = Path(name).stem if Path(name).suffix else name
+            fname = f"{aid[-6:]}-{_safe_filename(base_stem, 'attachment')}{ext}"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            local_path = dest_dir / fname
+
+            if not (local_path.exists() and local_path.stat().st_size > 0 and (not size_bytes or local_path.stat().st_size == size_bytes)):
+                dl_url = self._rewrite_local_url(url)
+                req = urllib.request.Request(
+                    dl_url,
+                    headers={"X-Api-Key": self.api_key},
+                    method="GET",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        content = resp.read(max_bytes + 1)
+                        if len(content) > max_bytes:
+                            log.warning("card %s: attachment %s exceeded %d bytes; skipping", task_id, aid, max_bytes)
+                            local_path = None  # type: ignore[assignment]
+                        else:
+                            tmp_path = local_path.with_suffix(local_path.suffix + ".part")
+                            tmp_path.write_bytes(content)
+                            tmp_path.replace(local_path)
+                            size_bytes = len(content)
+                except Exception:
+                    log.warning("card %s: downloading attachment %s (%s) failed", task_id, aid, name, exc_info=True)
+                    local_path = None  # type: ignore[assignment]
+
+            results.append(
+                Attachment(
+                    id=aid,
+                    name=name,
+                    kind="file",
+                    url=url,
+                    mime_type=mime_type,
+                    size_bytes=size_bytes,
+                    is_image=is_image,
+                    local_path=local_path,
+                )
+            )
+        return results
+
+    def upload_attachment(
+        self, task_id: str, file_path: Path, name: str | None = None
+    ) -> Attachment | None:
+        """Upload `file_path` onto a Planka card as the bot user (`editor` role)."""
+        if not file_path.is_file():
+            return None
+        raw = file_path.read_bytes()
+        display_name = (name or file_path.name).strip()[:128] or file_path.name[:128]
+        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        body, content_type = _encode_multipart(
+            fields=[("type", "file"), ("name", display_name)],
+            file_field="file",
+            filename=file_path.name,
+            content_type=mime_type,
+            data=raw,
+        )
+        headers = {
+            "X-Api-Key": self.bot_api_key or self.api_key,
+            "Content-Type": content_type,
+        }
+        req = urllib.request.Request(
+            f"{self.api_url}/cards/{task_id}/attachments",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read())
+        item = payload.get("item") or {}
+        adata = item.get("data") or {}
+        return Attachment(
+            id=str(item.get("id") or ""),
+            name=str(item.get("name") or display_name),
+            kind="file",
+            url=str(adata.get("url") or ""),
+            mime_type=str(adata.get("mimeType") or mime_type),
+            size_bytes=int(adata.get("sizeInBytes") or len(raw)),
+            is_image=bool(adata.get("image")) or mime_type.startswith("image/"),
+            local_path=file_path,
+        )
 
     def parse_webhook(self, headers: dict[str, str], body: bytes) -> WebhookEvent | None:
         auth = headers.get("authorization", "")
