@@ -420,6 +420,54 @@ class PlankaBoard(BoardProvider):
         authors = {comment.author_username, doer_username}
         return bool(self.bot_api_key) and self.bot_username in authors
 
+    def sync_checklist(self, task_id: str, list_name: str, items: list[tuple[str, bool]]) -> None:
+        """Create or update a native Planka Task List (`showOnFrontOfCard=True`) on a card."""
+        if not items:
+            return
+        data = self._api("GET", f"/cards/{task_id}") or {}
+        inc = data.get("included") or {}
+        task_lists = inc.get("taskLists") or []
+        tasks = inc.get("tasks") or []
+
+        target_name = list_name.strip() or "Tasks"
+        tl = next(
+            (t for t in task_lists if (t.get("name") or "").strip().lower() == target_name.lower()),
+            None,
+        )
+        if tl is None:
+            max_pos = max((t.get("position") or 0 for t in task_lists), default=0)
+            tl = self._api(
+                "POST",
+                f"/cards/{task_id}/task-lists",
+                {
+                    "name": target_name[:128],
+                    "position": max_pos + 65536,
+                    "showOnFrontOfCard": True,
+                },
+            )["item"]
+        tl_id = str(tl["id"])
+
+        existing_items = [t for t in tasks if str(t.get("taskListId")) == tl_id]
+        by_norm = {(t.get("name") or "").strip().lower(): t for t in existing_items}
+        max_item_pos = max((t.get("position") or 0 for t in existing_items), default=0)
+
+        for raw_name, is_done in items:
+            name = raw_name.strip()[:1024]
+            if not name:
+                continue
+            cur = by_norm.get(name.lower())
+            if cur is not None:
+                if bool(cur.get("isCompleted")) != bool(is_done):
+                    self._api("PATCH", f"/tasks/{cur['id']}", {"isCompleted": bool(is_done)})
+            else:
+                max_item_pos += 65536
+                created = self._api(
+                    "POST",
+                    f"/task-lists/{tl_id}/tasks",
+                    {"name": name, "position": max_item_pos, "isCompleted": bool(is_done)},
+                )["item"]
+                by_norm[name.lower()] = created
+
     def parse_webhook(self, headers: dict[str, str], body: bytes) -> WebhookEvent | None:
         auth = headers.get("authorization", "")
         token = auth.removeprefix("Bearer ").strip()

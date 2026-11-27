@@ -67,6 +67,12 @@ $KANBAN comment <card_id> "Please also add unit tests."
 $KANBAN label <card_id> add <label>
 $KANBAN label <card_id> remove <label>
 
+# Manage native Planka checklists (Task Lists)
+$KANBAN checklist <card_id> add-list "Implementation"
+$KANBAN checklist <card_id> add "Build Docker image" --list "Implementation"
+$KANBAN checklist <card_id> check "Build Docker image"
+$KANBAN checklist <card_id> uncheck "Build Docker image"
+
 # Delete a card
 $KANBAN delete <card_id>
 ```
@@ -84,11 +90,12 @@ $KANBAN delete <card_id>
 | :---: | :--- | :--- | :--- |
 | 1 | Backlog | `1916814903729980427` | Unscheduled ideas |
 | 2 | To-Do | `1916814903839032332` | Ready / queued (`⏳ Queued` if 2 slots busy) |
-| 3 | Need Action | `1916814903922918413` | Agent asked a question, requested access, or failed |
+| 3 | Need Action | `1916814903922918413` | Blocked mid-run (Q&A, `/setup`, access request, or failure) |
 | 4 | Doing | `1916814904006804494` | Actively running (30s progress updates) |
-| 5 | Auditing | `1916814904073913359` | **Manual audit trigger** — move card here for read-only audit |
-| 6 | Done | `1916814904141022224` | Closed list — finished runs land here directly (no auto-audit) |
-| 7 | Flagged | `1916814904208131089` | Auditor found problems (`audit:<flag>` labels) |
+| 5 | Pending | `1917262480980051556` | Finished run or passed audit — waiting for user review / close |
+| 6 | Auditing | `1916814904073913359` | **Manual audit trigger** — move card here for read-only audit |
+| 7 | Done | `1916814904141022224` | Closed list — **user-only** (drag manually or comment `done` / `mark done`) |
+| 8 | Flagged | `1916814904208131089` | Auditor found problems (`audit:<flag>` labels) |
 
 ## Paths, Repo Worktrees, Service Management & Backups
 

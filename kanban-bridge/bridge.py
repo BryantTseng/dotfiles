@@ -136,6 +136,7 @@ LEGACY_PLACEHOLDERS = ("Working on it…", "🔍 Audit: reviewing…")
 BUCKET_PLANNING = ENV.get("BRIDGE_PLANNING_BUCKET", "planning").strip().lower()
 BUCKET_DOING = "doing"
 BUCKET_NEEDS_ACTION = "need action"
+BUCKET_PENDING = ENV.get("BRIDGE_PENDING_BUCKET", "pending").strip().lower()
 BUCKET_AUDITING = ENV.get("BRIDGE_AUDIT_BUCKET", "auditing").strip().lower()
 BUCKET_FLAGGED = "flagged"
 
@@ -494,15 +495,31 @@ def system_prompt(
     )
 
     parts.append(
+        "To populate or update the card's native Task List (checklist), you may include one or more "
+        "`CHECKLIST:` blocks before the status line:\n"
+        "CHECKLIST: <Checklist Name>\n"
+        "- [x] Completed step\n"
+        "- [ ] Remaining or manual step for the user (e.g. build/run container, configure secrets)\n"
+        "Use this whenever there are multi-step milestones or remaining manual steps so the user sees "
+        "progress right on the card face."
+    )
+
+    parts.append(
         "End your final message with exactly one status line on its own:\n"
         "STATUS: NEEDS_INPUT  (you asked a question, proposed a plan awaiting sign-off, requested access, or are blocked)\n"
-        "STATUS: DONE         (the task is complete and nothing is needed from the user)"
+        "STATUS: DONE         (your work for this run is finished; the bridge moves the card to Pending for user review — never Done)"
     )
     return "\n\n".join(parts)
 
 
 STATUS_RE = re.compile(r"\n*\s*STATUS:\s*(NEEDS_INPUT|DONE)\s*$")
 ACCESS_REQUEST_RE = re.compile(r"^\s*ACCESS_REQUEST:\s*(.+?)\s*$", re.M)
+DONE_CMD_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:mark\s+(?:this\s+)?(?:card\s+)?(?:as\s+)?)?(?:move\s+(?:this\s+)?(?:card\s+)?to\s+)?(done|close)\s*[.!]?\s*$",
+    re.I,
+)
+_CHECKLIST_HEAD_RE = re.compile(r"^\s*CHECKLIST:\s*(.+?)\s*$")
+_CHECKLIST_ITEM_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$")
 
 
 def split_status(text: str) -> tuple[str, str]:
@@ -511,6 +528,40 @@ def split_status(text: str) -> tuple[str, str]:
     if not m:
         return text, "NEEDS_INPUT"
     return text[: m.start()].rstrip(), m.group(1)
+
+
+def extract_checklists(text: str) -> tuple[str, list[tuple[str, list[tuple[str, bool]]]]]:
+    """Extract `CHECKLIST: <name>` blocks with `- [x]` / `- [ ]` items from an agent reply.
+
+    Returns `(cleaned_text, [(list_name, [(item_text, is_completed), ...]), ...])`.
+    """
+    lines = text.splitlines()
+    kept: list[str] = []
+    checklists: list[tuple[str, list[tuple[str, bool]]]] = []
+    i = 0
+    while i < len(lines):
+        hm = _CHECKLIST_HEAD_RE.match(lines[i])
+        if hm:
+            name = hm.group(1).strip()
+            items: list[tuple[str, bool]] = []
+            j = i + 1
+            while j < len(lines):
+                im = _CHECKLIST_ITEM_RE.match(lines[j])
+                if im:
+                    items.append((im.group(2).strip(), im.group(1).lower() == "x"))
+                    j += 1
+                elif not lines[j].strip() and j + 1 < len(lines) and _CHECKLIST_ITEM_RE.match(lines[j + 1]):
+                    j += 1
+                else:
+                    break
+            if items:
+                checklists.append((name, items))
+                i = j
+                continue
+        kept.append(lines[i])
+        i += 1
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return cleaned, checklists
 
 
 # ---------- access grants (approved by user in comments or confirm page) ----------
@@ -1245,6 +1296,17 @@ def handle(task_id: str) -> None:
     session_id = session_of(task)
     comments = BOARD.get_comments(task_id)
     pending = pending_user_comments(comments)
+
+    # Explicit user comment command (`done`, `mark done`, `move to done`, `close`) -> move to Done
+    # immediately with 0 agent tokens spent. Cards never auto-move to Done on their own.
+    if pending and all(DONE_CMD_RE.match(p) for p in pending):
+        if BOARD.move_to(task, "done"):
+            BOARD.post_comment(task_id, "✅ _Moved to Done._")
+            log.info("task %s: moved to Done by user comment command", task_id)
+        else:
+            BOARD.post_comment(task_id, "⚠️ _Could not find a `Done` list on this board._")
+        return
+
     access_notes = apply_access_decisions(task, comments, pending) if pending else []
     if access_notes:
         task = BOARD.get_task(task_id)
@@ -1433,12 +1495,23 @@ def run_task(
         if errors:
             reply += "\n\n_Requests the bridge can't grant: " + "; ".join(errors) + "_"
 
+    reply, checklists = extract_checklists(reply)
+    for cl_name, cl_items in checklists:
+        try:
+            BOARD.sync_checklist(task_id, cl_name, cl_items)
+            log.info("task %s: synced checklist %r (%d items)", task_id, cl_name, len(cl_items))
+        except Exception:
+            log.exception("task %s: syncing checklist %r failed", task_id, cl_name)
+
     if git_footer:
         reply += f"\n\n<sub>{git_footer}</sub>"
     BOARD.publish(task_id, placeholder.id, reply)
 
     if status == "DONE":
-        BOARD.move_to(task, "done")
+        # Never auto-move to Done: park in Pending for user review/deployment/manual close.
+        if not BOARD.move_to(task, BUCKET_PENDING):
+            BOARD.move_to(task, BUCKET_NEEDS_ACTION)
+        notify(task, f"✅ {AGENT.name} ready in Pending", first_paragraph(reply))
     else:
         BOARD.move_to(task, BUCKET_NEEDS_ACTION)
         if requested:
@@ -1622,9 +1695,14 @@ def audit_task(
         BOARD.add_label(task.id, FLAG_PREFIX + f, FLAG_COLOR)
     BOARD.add_label(task.id, AUDITED_LABEL, AUDITED_COLOR)
 
-    if verdict == "OK" or not BOARD.move_to(task, BUCKET_FLAGGED):
-        BOARD.move_to(task, "done")
-    if verdict != "OK":
+    if verdict == "OK":
+        # Clean audit returns to Pending — user decides when to move to Done.
+        if not BOARD.move_to(task, BUCKET_PENDING):
+            BOARD.move_to(task, BUCKET_NEEDS_ACTION)
+        notify(task, "✅ Audit passed — ready in Pending", first_paragraph(body))
+    else:
+        if not BOARD.move_to(task, BUCKET_FLAGGED):
+            BOARD.move_to(task, BUCKET_NEEDS_ACTION)
         notify(task, f"🚩 Audit flagged: {', '.join(flags) or 'see audit'}", first_paragraph(body))
     log.info("task %s: audit %s %s", task.id, verdict, flags)
 
