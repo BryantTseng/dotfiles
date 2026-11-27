@@ -119,6 +119,7 @@ desired = [
     ("To-Do", "active"),
     ("Need Action", "active"),
     ("Doing", "active"),
+    ("Pending", "active"),
     ("Auditing", "active"),
     ("Done", "closed"),
     ("Flagged", "active"),

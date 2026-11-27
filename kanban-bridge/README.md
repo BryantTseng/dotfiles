@@ -13,11 +13,13 @@ A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`**
 - **Columns (Board `Agy`):**
   1. **Backlog** — unscheduled ideas
   2. **To-Do** — ready / waiting (`⏳ Queued` comment if 2 slots are busy)
-  3. **Need Action** — agent asked a question, requested access, or failed (fires `notify-send` desktop notification)
+  3. **Need Action** — agent asked a question, requested access, needs `/setup` config, or failed (fires `notify-send`)
   4. **Doing** — actively running (30-second live progress updates on placeholder comment)
-  5. **Auditing** — **manual audit trigger**; drag any card here to run the read-only `--mode plan` auditor
-  6. **Done** *(closed list)* — finished runs (`STATUS: DONE`) move straight here **without** auto-auditing; clean audits return here with green `audited` label
-  7. **Flagged** — auditor found issues (`audit:<flag>` red labels + desktop notification)
+  5. **Pending** — agent finished its run (`STATUS: DONE`) or passed **Auditing**; ready for **your** review, live test, or deployment
+  6. **Auditing** — **manual audit trigger**; drag any card here to run the read-only auditor (clean → **Pending**, problems → **Flagged**)
+  7. **Done** *(closed list)* — **never entered automatically**; only moved here when you drag the card manually or comment `done` / `mark done` / `move to done` / `close` (0 tokens)
+  8. **Flagged** — auditor found issues (`audit:<flag>` red labels + desktop notification)
+- **Native Planka Checklists (`CHECKLIST:`):** Agents can include `CHECKLIST: <Title>` blocks with `- [x]` / `- [ ]` items before `STATUS:`, which the bridge syncs to Planka's native Task Lists (`showOnFrontOfCard: true`) so you see progress right on the card face.
 - **Pre-Run Intake (`⚙️ Configure this run` — 0 tokens):** When a brand-new `agy` card doesn't yet specify both a workspace choice (`worktree` / `in-place` / `scratch`) and execution mode (`plan-first` / `direct`), the bridge posts a signed 1-click setup form link (`http://localhost:8787/setup?...`) on the card (plus comment-reply shortcuts like `clerk worktree plan-first`) and moves it to **Need Action** before spending any agent tokens. Cards that already have those labels start immediately.
 - **Git Tracking & Isolated Repos (`~/workspace/kanban-bridge/repos/`):**
   - **Standalone scratch cards (`scratch`):** Each card gets its own git repo in `~/workspace/kanban-tasks/task-<id>-<slug>/` (one commit per run).

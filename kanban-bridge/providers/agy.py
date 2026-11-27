@@ -163,7 +163,8 @@ class AgyAgent(AgentProvider):
             steps = 0
             last_step: str | None = None
             result_payload: dict | None = None
-            text_chunks: list[str] = []
+            step_texts: dict[int, list[str]] = {}
+            last_text_step: int | None = None
             stop_ticker = threading.Event()
 
             def ticker():
@@ -218,7 +219,11 @@ class AgyAgent(AgentProvider):
                             tname = su.get("tool_name") or tinfo.get("name") or "?"
                             last_step = _describe_tool(tname, tinfo.get("parameters"))
                         elif su.get("step_type") == "agent_response" and su.get("text_delta"):
-                            text_chunks.append(su["text_delta"])
+                            delta = su["text_delta"]
+                            sidx = int(su.get("step_index") or 0)
+                            step_texts.setdefault(sidx, []).append(delta)
+                            if delta.strip():
+                                last_text_step = sidx
                     elif ev_type == "result":
                         result_payload = ev.get("result") or ev
                         cid = result_payload.get("conversation_id")
@@ -235,6 +240,8 @@ class AgyAgent(AgentProvider):
                 procs.discard(p)
                 stop_ticker.set()
                 timer.cancel()
+                if p.stdout:
+                    p.stdout.close()
                 if log_file:
                     log_file.close()
 
@@ -251,7 +258,10 @@ class AgyAgent(AgentProvider):
                 )
 
             status = str(result_payload.get("status") or "SUCCESS").upper()
-            text = (result_payload.get("response") or "".join(text_chunks)).strip()
+            # Use only the final agent_response step so intermediate background-wait chatter
+            # (e.g. "Running cargo test... waiting for build to finish.") doesn't pollute the reply.
+            final_step_text = "".join(step_texts.get(last_text_step, [])).strip() if last_text_step is not None else ""
+            text = final_step_text or (result_payload.get("response") or "").strip()
             denied = result_payload.get("denied_actions") or []
             err_msg = result_payload.get("error")
 

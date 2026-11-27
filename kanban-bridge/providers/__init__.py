@@ -167,6 +167,10 @@ class BoardProvider(ABC):
         """
         return None
 
+    def sync_checklist(self, task_id: str, list_name: str, items: list[tuple[str, bool]]) -> None:
+        """Create or update a named checklist (`[(text, is_completed), ...]`) on a card."""
+        return None
+
 
 class AgentProvider(ABC):
     """Abstract interface for an AI coding agent runtime (Agy, Claude Code, etc.)."""

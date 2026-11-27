@@ -183,6 +183,104 @@ class TestClaudeAgent(unittest.TestCase):
             self.assertIn("- Bash [ERROR/DENIED]:", calls[1])
 
 
+class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
+    def test_agy_strips_intermediate_background_wait_chatter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            events = [
+                {"event": "init", "conversation_id": "conv-abc"},
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-abc",
+                        "step_index": 10,
+                        "state": "DONE",
+                        "step_type": "agent_response",
+                        "text_delta": "Running `cargo test` to compile; waiting for build to finish.\n",
+                    },
+                },
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-abc",
+                        "step_index": 71,
+                        "state": "ACTIVE",
+                        "step_type": "agent_response",
+                        "text_delta": "Implemented the Rust notifier.\n",
+                    },
+                },
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "conv-abc",
+                        "step_index": 71,
+                        "state": "DONE",
+                        "step_type": "agent_response",
+                        "text_delta": "STATUS: DONE\n",
+                    },
+                },
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-abc",
+                        "status": "SUCCESS",
+                        "response": "Running `cargo test` to compile; waiting for build to finish.\nImplemented the Rust notifier.\nSTATUS: DONE\n",
+                    },
+                },
+            ]
+            fake_cmd = [
+                sys.executable,
+                "-c",
+                "import sys; print(" + repr("\n".join(json.dumps(e) for e in events)) + ")",
+            ]
+            agent = AgyAgent(agy_bin=sys.executable, base_env={})
+            res = agent._run_streaming(
+                cmd=fake_cmd,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_dir=tmp_path,
+            )
+            self.assertFalse(res.is_error)
+            self.assertEqual(res.session_id, "conv-abc")
+            self.assertNotIn("waiting for build to finish", res.text)
+            self.assertEqual(res.text, "Implemented the Rust notifier.\nSTATUS: DONE")
+
+    def test_extract_checklists_and_done_command_regex(self):
+        import os
+        os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+        import bridge
+
+        raw = (
+            "Summary of work.\n\n"
+            "CHECKLIST: Implementation\n"
+            "- [x] Build Rust notifier\n"
+            "- [X] Pass unit tests\n"
+            "- [ ] Run docker compose with Discord token\n\n"
+            "All ready for your review."
+        )
+        cleaned, cls = bridge.extract_checklists(raw)
+        self.assertEqual(len(cls), 1)
+        self.assertEqual(cls[0][0], "Implementation")
+        self.assertEqual(
+            cls[0][1],
+            [
+                ("Build Rust notifier", True),
+                ("Pass unit tests", True),
+                ("Run docker compose with Discord token", False),
+            ],
+        )
+        self.assertNotIn("CHECKLIST:", cleaned)
+        self.assertIn("Summary of work.", cleaned)
+        self.assertIn("All ready for your review.", cleaned)
+
+        for ok_msg in ("done", "Done.", "mark done", "move to done", "please mark this card as done!", "close"):
+            self.assertIsNotNone(bridge.DONE_CMD_RE.match(ok_msg), f"should match: {ok_msg!r}")
+        for no_msg in ("done with step 1, now add tests", "not done yet", "close the modal after click"):
+            self.assertIsNone(bridge.DONE_CMD_RE.match(no_msg), f"should NOT match: {no_msg!r}")
+
+
 class TestPlankaSessionTagCompat(unittest.TestCase):
     def test_session_tag_matches_agy_claude_and_kanban(self):
         for prefix in ("agy", "claude", "kanban"):

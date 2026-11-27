@@ -172,6 +172,23 @@ def cmd_show(cli: PlankaClient, args) -> None:
     users = {str(u["id"]): u.get("username") or u.get("name") or "?" for u in ((cdata.get("included") or {}).get("users") or [])}
     comments = sorted(cdata.get("items") or [], key=lambda c: (c.get("createdAt") or "", int(c["id"])))
 
+    card_inc = data.get("included") or {}
+    raw_tls = sorted(card_inc.get("taskLists") or [], key=lambda x: x.get("position") or 0)
+    raw_tasks = sorted(card_inc.get("tasks") or [], key=lambda x: x.get("position") or 0)
+    checklists = []
+    for tl in raw_tls:
+        tlid = str(tl["id"])
+        items = [
+            {
+                "id": str(t["id"]),
+                "name": t.get("name") or "",
+                "isCompleted": bool(t.get("isCompleted")),
+            }
+            for t in raw_tasks
+            if str(t.get("taskListId")) == tlid
+        ]
+        checklists.append({"id": tlid, "name": tl.get("name") or "", "items": items})
+
     if args.json:
         print(json.dumps({
             "id": str(card["id"]),
@@ -181,6 +198,7 @@ def cmd_show(cli: PlankaClient, args) -> None:
             "has_session": has_sess,
             "description": desc,
             "url": f"{cli.base_url}/cards/{card['id']}",
+            "checklists": checklists,
             "comments": [
                 {
                     "id": str(c["id"]),
@@ -200,6 +218,14 @@ def cmd_show(cli: PlankaClient, args) -> None:
     print(f"Session: {'attached' if has_sess else 'none'}")
     if desc:
         print(f"\n## Description\n{desc}")
+    if checklists:
+        print("\n## Checklists")
+        for cl in checklists:
+            done_n = sum(1 for x in cl["items"] if x["isCompleted"])
+            print(f"### {cl['name']} ({done_n}/{len(cl['items'])})  [list:{cl['id']}]")
+            for item in cl["items"]:
+                mark = "x" if item["isCompleted"] else " "
+                print(f"  - [{mark}] {item['name']}  [item:{item['id']}]")
     print(f"\n## Comments ({len(comments)})")
     for c in comments:
         author = users.get(str(c.get("userId")), "?")
@@ -355,6 +381,73 @@ def cmd_delete(cli: PlankaClient, args) -> None:
     print(f"Deleted card {args.card_id}")
 
 
+def cmd_checklist(cli: PlankaClient, args) -> None:
+    data = cli.req("GET", f"/cards/{args.card_id}") or {}
+    inc = data.get("included") or {}
+    tls = sorted(inc.get("taskLists") or [], key=lambda x: x.get("position") or 0)
+    tasks = sorted(inc.get("tasks") or [], key=lambda x: x.get("position") or 0)
+
+    def find_list(name_or_id: str) -> dict | None:
+        key = name_or_id.strip().lower()
+        return next(
+            (t for t in tls if str(t["id"]) == name_or_id or (t.get("name") or "").strip().lower() == key),
+            None,
+        )
+
+    def find_item(name_or_id: str) -> dict | None:
+        key = name_or_id.strip().lower()
+        return next(
+            (t for t in tasks if str(t["id"]) == name_or_id or (t.get("name") or "").strip().lower() == key),
+            None,
+        )
+
+    act = args.action
+    if act == "add-list":
+        max_pos = max((t.get("position") or 0 for t in tls), default=0)
+        tl = cli.req(
+            "POST",
+            f"/cards/{args.card_id}/task-lists",
+            {"name": args.target, "position": max_pos + 65536, "showOnFrontOfCard": True},
+        )["item"]
+        print(f"Created checklist {tl['name']!r} (id: {tl['id']})")
+    elif act == "add":
+        list_name = args.list_name or "Tasks"
+        tl = find_list(list_name)
+        if not tl:
+            max_pos = max((t.get("position") or 0 for t in tls), default=0)
+            tl = cli.req(
+                "POST",
+                f"/cards/{args.card_id}/task-lists",
+                {"name": list_name, "position": max_pos + 65536, "showOnFrontOfCard": True},
+            )["item"]
+        tl_tasks = [t for t in tasks if str(t.get("taskListId")) == str(tl["id"])]
+        max_ipos = max((t.get("position") or 0 for t in tl_tasks), default=0)
+        item = cli.req(
+            "POST",
+            f"/task-lists/{tl['id']}/tasks",
+            {"name": args.target, "position": max_ipos + 65536, "isCompleted": bool(args.done)},
+        )["item"]
+        print(f"Added checklist item {item['name']!r} (id: {item['id']}, done={bool(args.done)})")
+    elif act in ("check", "uncheck"):
+        item = find_item(args.target)
+        if not item:
+            raise SystemExit(f"Checklist item not found: {args.target!r}")
+        cli.req("PATCH", f"/tasks/{item['id']}", {"isCompleted": act == "check"})
+        print(f"{'Checked' if act == 'check' else 'Unchecked'} item {item['name']!r}")
+    elif act == "delete-item":
+        item = find_item(args.target)
+        if not item:
+            raise SystemExit(f"Checklist item not found: {args.target!r}")
+        cli.req("DELETE", f"/tasks/{item['id']}")
+        print(f"Deleted checklist item {item['id']}")
+    elif act == "delete-list":
+        tl = find_list(args.target)
+        if not tl:
+            raise SystemExit(f"Checklist not found: {args.target!r}")
+        cli.req("DELETE", f"/task-lists/{tl['id']}")
+        print(f"Deleted checklist {tl['id']}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Safe CLI for operating the local Planka kanban board.")
     p.add_argument("--board", help="Board ID or name (defaults to 'Agy')")
@@ -365,7 +458,7 @@ def main() -> None:
     p_board = sub.add_parser("board", help="List columns and cards")
     p_board.add_argument("--json", action="store_true")
 
-    p_show = sub.add_parser("show", help="Show card details and comments")
+    p_show = sub.add_parser("show", help="Show card details, checklists, and comments")
     p_show.add_argument("card_id")
     p_show.add_argument("--json", action="store_true")
 
@@ -402,6 +495,13 @@ def main() -> None:
     p_label.add_argument("label")
     p_label.add_argument("--confirm-trigger", action="store_true")
 
+    p_cl = sub.add_parser("checklist", help="Manage native Planka Task Lists (checklists) on a card")
+    p_cl.add_argument("card_id")
+    p_cl.add_argument("action", choices=["add-list", "add", "check", "uncheck", "delete-item", "delete-list"])
+    p_cl.add_argument("target", help="Checklist name/ID or item text/ID")
+    p_cl.add_argument("--list", dest="list_name", help="Checklist name/ID when using 'add' (default: Tasks)")
+    p_cl.add_argument("--done", action="store_true", help="Mark newly added item completed")
+
     p_del = sub.add_parser("delete", help="Delete a card")
     p_del.add_argument("card_id")
 
@@ -416,6 +516,7 @@ def main() -> None:
         "edit": cmd_edit,
         "comment": cmd_comment,
         "label": cmd_label,
+        "checklist": cmd_checklist,
         "delete": cmd_delete,
     }[args.cmd](cli, args)
 
