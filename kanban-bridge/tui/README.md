@@ -18,8 +18,8 @@ cargo run --release
 
 | Key | Action |
 | --- | --- |
-| `h` / `←`, `l` / `→` | Switch column |
-| `k` / `↑`, `j` / `↓` | Move between cards |
+| `Tab` / `Shift+Tab` | Next / previous column |
+| `↑` / `↓` or `k` / `j` | Move between cards |
 | `o` | Open selected card in the browser (`xdg-open`) |
 | `r` | Refresh now |
 | `q` / `Esc` | Quit |

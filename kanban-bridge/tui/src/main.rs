@@ -64,8 +64,8 @@ fn run(
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('h') | KeyCode::Left => app.move_col(-1),
-                    KeyCode::Char('l') | KeyCode::Right => app.move_col(1),
+                    KeyCode::Tab => app.move_col(1),
+                    KeyCode::BackTab => app.move_col(-1),
                     KeyCode::Char('k') | KeyCode::Up => app.move_row(-1),
                     KeyCode::Char('j') | KeyCode::Down => app.move_row(1),
                     KeyCode::Char('r') => last_poll = Instant::now() - POLL_INTERVAL,
