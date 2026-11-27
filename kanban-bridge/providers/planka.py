@@ -221,29 +221,39 @@ class PlankaBoard(BoardProvider):
             self._api("PATCH", f"/webhooks/{existing_hook['id']}", {"events": desired_events})
             log.info("updated Planka webhook events -> %s", desired_events)
 
-        # 2. Ensure bot user has viewer+canComment membership on every board
+        # 2. Ensure bot user has editor membership on every board (so moves, checklists,
+        # labels, and comments all appear as the bot in Planka's Actions feed).
         bot_uid = self._resolve_bot_user_id()
         if not bot_uid:
             return
         proj_data = self._api("GET", "/projects") or {}
         boards = (proj_data.get("included") or {}).get("boards") or []
-        memberships = (proj_data.get("included") or {}).get("boardMemberships") or []
         for b in boards:
             bid = str(b["id"])
-            has_bot = any(
-                str(m.get("boardId")) == bid and str(m.get("userId")) == bot_uid for m in memberships
-            )
-            if not has_bot:
+            bundle = self._get_board_bundle(bid)
+            memberships = (bundle.get("included") or {}).get("boardMemberships") or []
+            bot_m = next((m for m in memberships if str(m.get("userId")) == bot_uid), None)
+            if bot_m is None:
                 try:
                     self._api(
                         "POST",
                         f"/boards/{bid}/board-memberships",
-                        {"userId": bot_uid, "role": "viewer", "canComment": True},
+                        {"userId": bot_uid, "role": "editor"},
                     )
-                    log.info("added bot user %s to Planka board %s (%s)", self.bot_username, bid, b.get("name"))
+                    log.info("added bot user %s (editor) to Planka board %s (%s)", self.bot_username, bid, b.get("name"))
                 except urllib.error.HTTPError as e:
                     if e.code != 409:  # already member
                         log.warning("could not add bot to board %s: %s", bid, e)
+            elif bot_m.get("role") != "editor":
+                try:
+                    self._api(
+                        "PATCH",
+                        f"/board-memberships/{bot_m['id']}",
+                        {"role": "editor"},
+                    )
+                    log.info("upgraded bot user %s to editor on Planka board %s (%s)", self.bot_username, bid, b.get("name"))
+                except urllib.error.HTTPError as e:
+                    log.warning("could not upgrade bot role on board %s: %s", bid, e)
 
     def get_task(self, task_id: str) -> Task:
         data = self._api("GET", f"/cards/{task_id}") or {}
@@ -344,6 +354,7 @@ class PlankaBoard(BoardProvider):
             "POST",
             f"/boards/{board_id}/labels",
             {"name": title, "color": _planka_color(color), "position": max_pos + 65536},
+            api_key=self.bot_api_key,
         )
         return res["item"]
 
@@ -351,7 +362,12 @@ class PlankaBoard(BoardProvider):
         card = (self._api("GET", f"/cards/{task_id}") or {})["item"]
         lbl = self._get_or_create_label(str(card["boardId"]), title, color)
         try:
-            self._api("POST", f"/cards/{task_id}/card-labels", {"labelId": str(lbl["id"])})
+            self._api(
+                "POST",
+                f"/cards/{task_id}/card-labels",
+                {"labelId": str(lbl["id"])},
+                api_key=self.bot_api_key,
+            )
         except urllib.error.HTTPError as e:
             if e.code != 409:  # already attached
                 raise
@@ -363,7 +379,7 @@ class PlankaBoard(BoardProvider):
         desc = SESSION_TAG_RE.sub("", desc).rstrip()
         tag = f"<!-- agy-session:{session_id} -->"
         new_desc = f"{desc}\n\n{tag}" if desc else tag
-        self._api("PATCH", f"/cards/{task_id}", {"description": new_desc})
+        self._api("PATCH", f"/cards/{task_id}", {"description": new_desc}, api_key=self.bot_api_key)
 
     def remove_labels(self, task: Task, predicate: Callable[[str], bool]) -> None:
         for l in task.labels:
@@ -371,7 +387,11 @@ class PlankaBoard(BoardProvider):
                 continue
             if predicate(l.title):
                 try:
-                    self._api("DELETE", f"/cards/{task.id}/card-labels/labelId:{l.id}")
+                    self._api(
+                        "DELETE",
+                        f"/cards/{task.id}/card-labels/labelId:{l.id}",
+                        api_key=self.bot_api_key,
+                    )
                 except urllib.error.HTTPError as e:
                     if e.code != 404:
                         raise
@@ -396,6 +416,7 @@ class PlankaBoard(BoardProvider):
                 "PATCH",
                 f"/cards/{task.id}",
                 {"listId": str(lst["id"]), "position": 65536},
+                api_key=self.bot_api_key,
             )
             return True
         except urllib.error.HTTPError as e:
@@ -444,6 +465,7 @@ class PlankaBoard(BoardProvider):
                     "position": max_pos + 65536,
                     "showOnFrontOfCard": True,
                 },
+                api_key=self.bot_api_key,
             )["item"]
         tl_id = str(tl["id"])
 
@@ -458,13 +480,19 @@ class PlankaBoard(BoardProvider):
             cur = by_norm.get(name.lower())
             if cur is not None:
                 if bool(cur.get("isCompleted")) != bool(is_done):
-                    self._api("PATCH", f"/tasks/{cur['id']}", {"isCompleted": bool(is_done)})
+                    self._api(
+                        "PATCH",
+                        f"/tasks/{cur['id']}",
+                        {"isCompleted": bool(is_done)},
+                        api_key=self.bot_api_key,
+                    )
             else:
                 max_item_pos += 65536
                 created = self._api(
                     "POST",
                     f"/task-lists/{tl_id}/tasks",
                     {"name": name, "position": max_item_pos, "isCompleted": bool(is_done)},
+                    api_key=self.bot_api_key,
                 )["item"]
                 by_norm[name.lower()] = created
 
@@ -498,12 +526,16 @@ class PlankaBoard(BoardProvider):
                 doer_username=doer,
             )
         if ev in ("cardLabelCreate", "cardLabelDelete"):
+            if self.bot_api_key and doer == self.bot_username:
+                return None
             card_id = item.get("cardId")
             return WebhookEvent(event_type="task.updated", task_id=str(card_id), doer_username=doer) if card_id else None
         if ev == "cardCreate":
             card_id = item.get("id")
             return WebhookEvent(event_type="task.created", task_id=str(card_id), doer_username=doer) if card_id else None
         if ev == "cardUpdate":
+            if self.bot_api_key and doer == self.bot_username:
+                return None
             card_id = item.get("id")
             return WebhookEvent(event_type="task.updated", task_id=str(card_id), doer_username=doer) if card_id else None
         return None

@@ -9,7 +9,7 @@ A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`**
 - **Live Board UI:** Self-hosted Planka v2 (`http://localhost:3000`) backed by PostgreSQL 16 with real-time WebSocket auto-refresh (no manual page reloads).
 - **Trigger:** Applying the **`agy`** label to any open card starts a headless `agy -p --output-format stream-json --sandbox` session in `~/workspace/kanban-tasks/task-<id>-<slug>/`.
 - **Session Persistence:** The `agy` `conversation_id` is stored invisibly at the bottom of the card description as `<!-- agy-session:<uuid> -->` (keeping Planka's label picker clean). Every human comment on the card resumes that exact session with `--conversation <uuid>`.
-- **Bot User:** Replies are posted as a dedicated Planka `boardUser` (**`agy`**) with `viewer` + `canComment: true` permissions.
+- **Bot User:** Card moves, live checklist updates, labels, and replies are performed as a dedicated Planka `boardUser` (**`agy`**, board `editor` role) so Planka's **Actions** feed cleanly separates **`Agy`**'s automated updates from your manual drags/edits.
 - **Columns (Board `Agy`):**
   1. **Backlog** — unscheduled ideas
   2. **To-Do** — ready / waiting (`⏳ Queued` comment if 2 slots are busy)

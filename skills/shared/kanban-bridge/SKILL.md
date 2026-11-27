@@ -83,7 +83,7 @@ $KANBAN delete <card_id>
 - **API:** `http://localhost:3000/api` (`X-Api-Key`)
 - **Project:** `Agy` (`1916814609407280132`), **Board:** `Agy` (`1916814609835099142`)
 - **Trigger label:** `agy` (`1916814904292017170`)
-- **Bot user:** `agy` (`1916814609130456067`, role `viewer` + `canComment: true`)
+- **Bot user:** `agy` (`1916814609130456067`, board `editor` role — handles moves, checklists, labels, and comments)
 - **Compose stack:** `~/workspace/kanban-bridge/planka/docker-compose.yml` (`planka` + `planka-postgres` on `127.0.0.1:5433`)
 
 | Order | List | List ID | Role |

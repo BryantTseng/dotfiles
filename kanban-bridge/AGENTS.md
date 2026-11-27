@@ -17,7 +17,7 @@ Operational notes for AI agents (`agy`, `claudecode`, etc.) working in this repo
 ## Architecture
 - `bridge.py`: Core orchestrator (queueing, 2-slot cap, `/setup` intake, `plan-first` gate, git worktrees, access flow, notifications, auth proxy, graceful/forced shutdown, auto-reload via exit code `3`).
 - `providers/__init__.py`: `BoardProvider` and `AgentProvider` interfaces, loader (`planka`, `agy`, `claude`), and proxy token registry.
-- `providers/planka.py`: Planka v2 backend (live WebSocket UI, `X-Api-Key`, `viewer+canComment` bot user, invisible description session tag, webhooks).
+- `providers/planka.py`: Planka v2 backend (live WebSocket UI, `X-Api-Key`, board `editor` bot user `agy` for moves/checklists/labels/comments, invisible description session tag, webhooks).
 - `providers/agy.py`: Host `agy --sandbox` backend (`stream-json`, immediate session capture, live `Subagents & Tasks` checklist emission for `invoke_subagent`/`swarm`/`run_workflow`/backgrounded `run_command`, host audit log, read-only `--mode plan` auditor).
 - `providers/claude.py`: Claude Code backend (isolated `kanban-agent:latest` Docker containers + `:8788` OAuth proxy, or `BRIDGE_CLAUDE_MODE=host`, live `Subagents & Tasks` checklist emission for `Agent`/`Task`/`TodoWrite`, plus host read-only `--allowedTools Read,Grep,Glob` auditor).
 - `agent/Dockerfile`: Debian bookworm-slim image for containerized Claude Code runs (`claude`, `gh`, `aws`, `az`, `uv`, `git`, `ripgrep`, `nodejs`).

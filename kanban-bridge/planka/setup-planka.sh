@@ -104,14 +104,17 @@ if not board:
     }, api_key=admin_key)["item"]
 bid = str(board["id"])
 
-# Ensure admin is editor and bot is viewer+canComment on board
+# Ensure admin and bot are board editors (so bot card moves, checklists, labels & comments show as bot)
 bundle = api("GET", f"/boards/{bid}", api_key=admin_key) or {}
 inc = bundle.get("included") or {}
 members = inc.get("boardMemberships") or []
 if not any(str(m.get("userId")) == my_id for m in members):
     api("POST", f"/boards/{bid}/board-memberships", {"userId": my_id, "role": "editor"}, api_key=admin_key)
-if not any(str(m.get("userId")) == bot_id for m in members):
-    api("POST", f"/boards/{bid}/board-memberships", {"userId": bot_id, "role": "viewer", "canComment": True}, api_key=admin_key)
+bot_m = next((m for m in members if str(m.get("userId")) == bot_id), None)
+if bot_m is None:
+    api("POST", f"/boards/{bid}/board-memberships", {"userId": bot_id, "role": "editor"}, api_key=admin_key)
+elif bot_m.get("role") != "editor":
+    api("PATCH", f"/board-memberships/{bot_m['id']}", {"role": "editor"}, api_key=admin_key)
 
 existing_lists = {(l.get("name") or "").strip().lower(): l for l in (inc.get("lists") or []) if l.get("name")}
 desired = [

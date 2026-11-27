@@ -22,7 +22,7 @@ from providers import (
 )
 from providers.agy import AgyAgent
 from providers.claude import ClaudeAgent, _worktree_git_mount
-from providers.planka import SESSION_TAG_RE
+from providers.planka import PlankaBoard, SESSION_TAG_RE
 
 
 class TestProviderLoadingAndRegistry(unittest.TestCase):
@@ -516,6 +516,52 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
             m = SESSION_TAG_RE.search(f"Body text\n\n<!-- {prefix}-session:abc-123 -->")
             self.assertIsNotNone(m, f"failed for prefix {prefix}")
             self.assertEqual(m.group(1), "abc-123")
+
+    def test_bot_api_key_used_for_moves_checklists_and_ignores_self_echo(self):
+        board = PlankaBoard(
+            base_url="http://127.0.0.1:3000",
+            api_key="admin-key",
+            webhook_url="http://127.0.0.1:8787/planka",
+            webhook_secret="sec",
+            bot_api_key="bot-key",
+            bot_username="agy",
+        )
+        calls: list[tuple[str, str, str | None]] = []
+
+        def fake_api(method: str, path: str, payload=None, *, api_key=None):
+            calls.append((method, path, api_key))
+            if path == "/boards/b1":
+                return {"included": {"lists": [{"id": "l2", "name": "Pending", "type": "active"}]}}
+            if path == "/cards/c1" and method == "GET":
+                return {"item": {"id": "c1", "boardId": "b1", "description": "hi"}, "included": {"taskLists": [], "tasks": []}}
+            if path == "/cards/c1/task-lists":
+                return {"item": {"id": "tl1", "name": "Subagents & Tasks"}}
+            if path == "/task-lists/tl1/tasks":
+                return {"item": {"id": "t1", "name": "[subagent] x", "isCompleted": False}}
+            return {"item": {}}
+
+        board._api = fake_api  # type: ignore[method-assign]
+        t = Task(id="c1", title="Card", project_id="b1")
+        self.assertTrue(board.move_to(t, "Pending"))
+        board.sync_checklist("c1", "Subagents & Tasks", [("[subagent] x", False)])
+        board.attach_session_label("c1", "sess-1", "session:", "grey")
+
+        mut_keys = {k for m, _, k in calls if m in ("POST", "PATCH", "DELETE")}
+        self.assertEqual(mut_keys, {"bot-key"})
+
+        # Bot self-echo cardUpdate is ignored; human cardUpdate is processed
+        bot_ev = board.parse_webhook(
+            {"authorization": "Bearer sec"},
+            json.dumps({"event": "cardUpdate", "data": {"item": {"id": "c1"}}, "user": {"username": "agy"}}).encode(),
+        )
+        self.assertIsNone(bot_ev)
+        human_ev = board.parse_webhook(
+            {"authorization": "Bearer sec"},
+            json.dumps({"event": "cardUpdate", "data": {"item": {"id": "c1"}}, "user": {"username": "bryant"}}).encode(),
+        )
+        self.assertIsNotNone(human_ev)
+        assert human_ev is not None
+        self.assertEqual(human_ev.task_id, "c1")
 
 
 if __name__ == "__main__":
