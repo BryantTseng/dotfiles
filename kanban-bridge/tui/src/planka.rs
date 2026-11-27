@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::session;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
@@ -7,13 +8,22 @@ use std::{
     thread,
 };
 
+const SUBAGENT_LIST: &str = "Subagents & Tasks";
+const SUBAGENT_PREFIX: &str = "[subagent] ";
+
+#[derive(Clone, Debug)]
+pub struct Subagent {
+    pub name: String,
+    pub done: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Card {
-    pub id: String,
     pub name: String,
     pub labels: Vec<String>,
-    pub has_session: bool,
+    pub session: Option<String>,
     pub url: String,
+    pub subagents: Vec<Subagent>,
 }
 
 #[derive(Clone, Debug)]
@@ -28,51 +38,18 @@ pub struct Board {
     pub columns: Vec<Column>,
 }
 
-#[derive(Clone, Debug)]
-pub struct Task {
-    pub text: String,
-    pub done: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct Checklist {
-    pub name: String,
-    pub tasks: Vec<Task>,
-}
-
-pub enum Request {
-    Board,
-    Card(String),
-}
-
-pub enum Update {
-    Board(Result<Board, String>),
-    Checklists(String, Result<Vec<Checklist>, String>),
-}
-
-pub fn spawn(cfg: Config) -> (Sender<Request>, Receiver<Update>) {
-    let (req_tx, req_rx) = mpsc::channel::<Request>();
-    let (upd_tx, upd_rx) = mpsc::channel::<Update>();
+pub fn spawn(cfg: Config) -> (Sender<()>, Receiver<Result<Board, String>>) {
+    let (req_tx, req_rx) = mpsc::channel::<()>();
+    let (upd_tx, upd_rx) = mpsc::channel::<Result<Board, String>>();
     thread::spawn(move || {
         let client = Client { cfg };
-        for req in req_rx {
-            let update = match req {
-                Request::Board => Update::Board(client.board().map_err(fmt_err)),
-                Request::Card(id) => {
-                    let res = client.checklists(&id).map_err(fmt_err);
-                    Update::Checklists(id, res)
-                }
-            };
-            if upd_tx.send(update).is_err() {
+        for () in req_rx {
+            if upd_tx.send(client.board().map_err(|e| format!("{e:#}"))).is_err() {
                 break;
             }
         }
     });
     (req_tx, upd_rx)
-}
-
-fn fmt_err(e: anyhow::Error) -> String {
-    format!("{e:#}")
 }
 
 struct Client {
@@ -93,7 +70,7 @@ impl Client {
 
     fn board(&self) -> Result<Board> {
         let projects = self.get("/projects")?;
-        let boards = projects["included"]["boards"].as_array().cloned().unwrap_or_default();
+        let boards = array(&projects["included"]["boards"]);
         let wanted = [self.cfg.trigger_label.to_lowercase(), "agy".to_string()];
         let chosen = wanted
             .iter()
@@ -117,6 +94,28 @@ impl Client {
         for cl in array(&inc["cardLabels"]) {
             if let Some(name) = labels.get(&id_str(&cl["labelId"])).filter(|n| !n.is_empty()) {
                 card_labels.entry(id_str(&cl["cardId"])).or_default().push(name.clone());
+            }
+        }
+
+        let subagent_lists: HashMap<String, String> = array(&inc["taskLists"])
+            .iter()
+            .filter(|tl| tl["name"].as_str() == Some(SUBAGENT_LIST))
+            .map(|tl| (id_str(&tl["id"]), id_str(&tl["cardId"])))
+            .collect();
+        let mut tasks: Vec<&Value> = array(&inc["tasks"]).iter().collect();
+        tasks.sort_by_key(|t| position(t));
+        let mut subagents: HashMap<String, Vec<Subagent>> = HashMap::new();
+        for t in tasks {
+            if let Some(card_id) = subagent_lists.get(&id_str(&t["taskListId"])) {
+                let raw = str_of(&t["name"]);
+                let name = raw.strip_prefix(SUBAGENT_PREFIX).unwrap_or(&raw).to_string();
+                subagents
+                    .entry(card_id.clone())
+                    .or_default()
+                    .push(Subagent {
+                        name,
+                        done: t["isCompleted"].as_bool().unwrap_or(false),
+                    });
             }
         }
 
@@ -147,9 +146,9 @@ impl Client {
                             Card {
                                 url: format!("{}/cards/{}", self.cfg.base_url, id),
                                 labels: card_labels.get(&id).cloned().unwrap_or_default(),
-                                has_session: has_session_tag(&str_of(&c["description"])),
+                                session: session::session_id(&str_of(&c["description"])),
+                                subagents: subagents.get(&id).cloned().unwrap_or_default(),
                                 name: str_of(&c["name"]),
-                                id,
                             }
                         })
                         .collect(),
@@ -161,34 +160,6 @@ impl Client {
             name: str_of(&chosen["name"]),
             columns,
         })
-    }
-
-    fn checklists(&self, card_id: &str) -> Result<Vec<Checklist>> {
-        let data = self.get(&format!("/cards/{card_id}"))?;
-        let inc = &data["included"];
-
-        let mut lists: Vec<&Value> = array(&inc["taskLists"]).iter().collect();
-        lists.sort_by_key(|l| position(l));
-        let mut tasks: Vec<&Value> = array(&inc["tasks"]).iter().collect();
-        tasks.sort_by_key(|t| position(t));
-
-        Ok(lists
-            .iter()
-            .map(|tl| {
-                let tlid = id_str(&tl["id"]);
-                Checklist {
-                    name: str_of(&tl["name"]),
-                    tasks: tasks
-                        .iter()
-                        .filter(|t| id_str(&t["taskListId"]) == tlid)
-                        .map(|t| Task {
-                            text: str_of(&t["name"]),
-                            done: t["isCompleted"].as_bool().unwrap_or(false),
-                        })
-                        .collect(),
-                }
-            })
-            .collect())
     }
 }
 
@@ -210,8 +181,4 @@ fn id_str(v: &Value) -> String {
 
 fn position(v: &Value) -> i64 {
     v["position"].as_f64().map(|p| p as i64).unwrap_or(0)
-}
-
-fn has_session_tag(description: &str) -> bool {
-    description.contains("<!--") && description.contains("-session:")
 }

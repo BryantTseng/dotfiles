@@ -1,21 +1,22 @@
-use crate::planka::{Board, Card, Checklist, Update};
-use std::{collections::HashMap, time::Instant};
+use crate::planka::{Board, Card};
+use crate::session::Live;
+use std::time::Instant;
 
 #[derive(Default)]
 pub struct App {
     pub board: Board,
     pub col: usize,
     pub rows: Vec<usize>,
-    pub checklists: HashMap<String, Vec<Checklist>>,
     pub error: Option<String>,
     pub loaded: bool,
     pub updated_at: Option<Instant>,
+    pub live: Option<Live>,
 }
 
 impl App {
-    pub fn apply(&mut self, update: Update) {
-        match update {
-            Update::Board(Ok(board)) => {
+    pub fn apply(&mut self, result: Result<Board, String>) {
+        match result {
+            Ok(board) => {
                 self.board = board;
                 self.loaded = true;
                 self.error = None;
@@ -23,11 +24,7 @@ impl App {
                 self.rows.resize(self.board.columns.len(), 0);
                 self.clamp();
             }
-            Update::Board(Err(e)) => self.error = Some(e),
-            Update::Checklists(id, Ok(lists)) => {
-                self.checklists.insert(id, lists);
-            }
-            Update::Checklists(_, Err(e)) => self.error = Some(e),
+            Err(e) => self.error = Some(e),
         }
     }
 
@@ -40,8 +37,8 @@ impl App {
         column.cards.get(*self.rows.get(self.col)?)
     }
 
-    pub fn selected_id(&self) -> Option<String> {
-        self.selected_card().map(|c| c.id.clone())
+    pub fn selected_session(&self) -> Option<String> {
+        self.selected_card()?.session.clone()
     }
 
     pub fn move_col(&mut self, delta: isize) {

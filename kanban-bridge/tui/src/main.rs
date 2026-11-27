@@ -1,12 +1,13 @@
 mod app;
 mod config;
 mod planka;
+mod session;
 mod ui;
 
 use anyhow::Result;
 use app::App;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use planka::Request;
+use planka::Board;
 use ratatui::DefaultTerminal;
 use std::{
     sync::mpsc::{Receiver, Sender},
@@ -14,10 +15,11 @@ use std::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+const LIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
     let cfg = config::Config::load()?;
-    let (tx, rx) = planka::spawn(cfg.clone());
+    let (tx, rx) = planka::spawn(cfg);
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, tx, rx);
@@ -27,32 +29,29 @@ fn main() -> Result<()> {
 
 fn run(
     terminal: &mut DefaultTerminal,
-    tx: Sender<Request>,
-    rx: Receiver<planka::Update>,
+    tx: Sender<()>,
+    rx: Receiver<Result<Board, String>>,
 ) -> Result<()> {
     let mut app = App::default();
     let mut last_poll = Instant::now() - POLL_INTERVAL;
-    let mut last_selected: Option<String> = None;
+    let mut last_live = Instant::now() - LIVE_INTERVAL;
+    let mut last_session: Option<String> = None;
 
     loop {
         if last_poll.elapsed() >= POLL_INTERVAL {
-            tx.send(Request::Board)?;
-            if let Some(id) = app.selected_id() {
-                tx.send(Request::Card(id))?;
-            }
+            tx.send(())?;
             last_poll = Instant::now();
         }
 
-        while let Ok(update) = rx.try_recv() {
-            app.apply(update);
+        while let Ok(result) = rx.try_recv() {
+            app.apply(result);
         }
 
-        let selected = app.selected_id();
-        if selected != last_selected {
-            if let Some(id) = &selected {
-                tx.send(Request::Card(id.clone()))?;
-            }
-            last_selected = selected;
+        let session = app.selected_session();
+        if session != last_session || last_live.elapsed() >= LIVE_INTERVAL {
+            app.live = session.as_deref().and_then(session::read);
+            last_session = session;
+            last_live = Instant::now();
         }
 
         terminal.draw(|f| ui::draw(f, &app))?;
