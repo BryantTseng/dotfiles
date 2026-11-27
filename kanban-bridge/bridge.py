@@ -505,6 +505,16 @@ def system_prompt(
     )
 
     parts.append(
+        "Card attachments & generated files:\n"
+        f"- Any images, PDFs, or files attached to this card are downloaded by the bridge into `{cwd / ATTACHMENTS_DIR_NAME}` "
+        "(excluded from git). Read them directly with your file viewer when relevant.\n"
+        "- Whenever the user asks you to generate or share an image, diagram, chart, or file on the card, "
+        "save/generate it and add one `ATTACH:` line per file before the status line:\n"
+        "ATTACH: <relative-or-absolute-path>\n"
+        "(or `ATTACH: <path> | <display name>`). The bridge uploads those files directly to the card as attachments."
+    )
+
+    parts.append(
         "End your final message with exactly one status line on its own:\n"
         "STATUS: NEEDS_INPUT  (you asked a question, proposed a plan awaiting sign-off, requested access, or are blocked)\n"
         "STATUS: DONE         (your work for this run is finished; the bridge moves the card to Pending for user review — never Done)"
@@ -520,6 +530,127 @@ DONE_CMD_RE = re.compile(
 )
 _CHECKLIST_HEAD_RE = re.compile(r"^\s*CHECKLIST:\s*(.+?)\s*$")
 _CHECKLIST_ITEM_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$")
+_ATTACH_LINE_RE = re.compile(r"^\s*ATTACH:\s*(.+?)\s*$")
+
+ATTACHMENTS_DIR_NAME = ".kanban-attachments"
+MAX_ATTACHMENT_BYTES = int(os.environ.get("BRIDGE_MAX_ATTACHMENT_MB", "25")) * 1024 * 1024
+_FORBIDDEN_ATTACH_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".kdbx")
+_FORBIDDEN_ATTACH_NAMES = {".env", ".netrc", "credentials", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"}
+
+
+def _ensure_git_exclude(cwd: Path, pattern: str) -> None:
+    """Add `pattern` to the repository's `.git/info/exclude` (works for worktrees too)."""
+    common = git(cwd, "rev-parse", "--git-common-dir")
+    if not common:
+        return
+    git_dir = Path(common)
+    if not git_dir.is_absolute():
+        git_dir = (cwd / git_dir).resolve()
+    exclude = git_dir / "info" / "exclude"
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text(encoding="utf-8", errors="replace").splitlines() if exclude.exists() else []
+        if pattern not in [ln.strip() for ln in existing]:
+            with exclude.open("a", encoding="utf-8") as f:
+                if existing and not exclude.read_text(encoding="utf-8", errors="replace").endswith("\n"):
+                    f.write("\n")
+                f.write(f"{pattern}\n")
+    except Exception:
+        log.warning("could not update git exclude at %s", exclude, exc_info=True)
+
+
+def extract_attachments(text: str) -> tuple[str, list[tuple[str, str | None]]]:
+    """Extract `ATTACH: <path>` or `ATTACH: <path> | <name>` directives outside fenced code blocks."""
+    lines = text.splitlines()
+    kept: list[str] = []
+    out: list[tuple[str, str | None]] = []
+    in_fence = False
+    for line in lines:
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            kept.append(line)
+            continue
+        if not in_fence:
+            m = _ATTACH_LINE_RE.match(line)
+            if m:
+                raw = m.group(1).strip()
+                if "|" in raw:
+                    path_part, name_part = raw.split("|", 1)
+                    disp = name_part.strip() or None
+                else:
+                    path_part, disp = raw, None
+                path_part = path_part.strip().strip("`'\"<>")
+                if path_part:
+                    out.append((path_part, disp))
+                    continue
+        kept.append(line)
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return cleaned, out
+
+
+def resolve_attachable_path(
+    raw_path: str, cwd: Path, session_id: str | None = None
+) -> tuple[Path | None, str | None]:
+    """Validate an agent-requested `ATTACH:` path against workspace/session-brain boundaries."""
+    p_str = raw_path.strip()
+    if p_str.startswith("file://"):
+        p_str = p_str[len("file://") :]
+    p = Path(p_str).expanduser()
+    if not p.is_absolute():
+        p = cwd / p
+    try:
+        resolved = p.resolve(strict=True)
+    except FileNotFoundError:
+        return None, f"`{raw_path}`: file not found"
+    except Exception as e:
+        return None, f"`{raw_path}`: invalid path ({e})"
+    if not resolved.is_file():
+        return None, f"`{raw_path}`: not a regular file"
+
+    allowed_roots = [cwd.resolve()]
+    if session_id and re.fullmatch(r"[A-Za-z0-9._-]+", session_id):
+        brain_root = (Path.home() / ".gemini" / "antigravity-cli" / "brain" / session_id).resolve()
+        if brain_root.exists():
+            allowed_roots.append(brain_root)
+
+    if not any(resolved == r or r in resolved.parents for r in allowed_roots):
+        return None, f"`{raw_path}`: outside allowed workspace"
+    if ".git" in resolved.parts:
+        return None, f"`{raw_path}`: files inside `.git` cannot be attached"
+
+    lower_name = resolved.name.lower()
+    if (
+        lower_name in _FORBIDDEN_ATTACH_NAMES
+        or lower_name.startswith(".env.")
+        or lower_name.endswith(_FORBIDDEN_ATTACH_SUFFIXES)
+    ):
+        return None, f"`{resolved.name}`: sensitive file type blocked"
+
+    size = resolved.stat().st_size
+    if size > MAX_ATTACHMENT_BYTES:
+        return None, f"`{resolved.name}`: exceeds {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit"
+    return resolved, None
+
+
+def format_inbound_attachments(attachments: list) -> str:
+    """Render a compact prompt block listing downloaded card attachments and links."""
+    if not attachments:
+        return ""
+    lines = [
+        "## Card Attachments",
+        "The card currently has the following attachments (use your file viewer to inspect images/PDFs/files):",
+    ]
+    for att in attachments:
+        if att.kind == "link":
+            lines.append(f"- [link] {att.name}: {att.url}")
+        elif att.local_path is not None:
+            kind_tag = "image" if att.is_image else (att.mime_type or "file")
+            size_kb = max(1, (att.size_bytes + 1023) // 1024) if att.size_bytes else 0
+            size_note = f", {size_kb} KB" if size_kb else ""
+            lines.append(f"- `{att.local_path}` ({att.name}; {kind_tag}{size_note})")
+        else:
+            lines.append(f"- {att.name} (could not be downloaded / exceeds size limit)")
+    return "\n".join(lines)
 
 
 def split_status(text: str) -> tuple[str, str]:
@@ -1401,30 +1532,67 @@ def run_task(
                 attached_session_id = cid
                 log.info("task %s: attached session label %s", task_id, cid)
 
+        subtask_q: queue.Queue[tuple[str, str, bool] | None] = queue.Queue()
+
+        def _subtask_worker():
+            while True:
+                item = subtask_q.get()
+                if item is None:
+                    return
+                cl_name, cl_text, cl_done = item
+                try:
+                    BOARD.sync_checklist(task_id, cl_name, [(cl_text, cl_done)])
+                except Exception:
+                    log.warning("task %s: live subtask checklist sync failed", task_id, exc_info=True)
+
+        subtask_thread = threading.Thread(target=_subtask_worker, daemon=True)
+
+        def on_subtask(cl_name: str, cl_text: str, cl_done: bool):
+            subtask_q.put((cl_name, cl_text, cl_done))
+
         try:
             cwd, repo_ctx = ensure_task_workspace(task)
+            _ensure_git_exclude(cwd, f"{ATTACHMENTS_DIR_NAME}/")
+            try:
+                inbound_atts = BOARD.sync_attachments_in(
+                    task_id, cwd / ATTACHMENTS_DIR_NAME, max_bytes=MAX_ATTACHMENT_BYTES
+                )
+            except Exception:
+                log.warning("task %s: syncing inbound attachments failed", task_id, exc_info=True)
+                inbound_atts = []
+            run_prompt = prompt
+            att_block = format_inbound_attachments(inbound_atts)
+            if att_block:
+                run_prompt = f"{prompt}\n\n{att_block}"
+
             BOARD.move_to(task, BUCKET_DOING)
             BOARD.remove_labels(task, lambda t: t == AUDITED_LABEL)
 
-            with tempfile.TemporaryDirectory() as tmp:
-                creds_env, cred_errors = credentials_for(granted, tmp)
-                extra_env = dict(creds_env)
-                if repo_ctx and SHARE_CARGO_TARGET and (cwd / "Cargo.toml").exists():
-                    extra_env.setdefault("CARGO_TARGET_DIR", str(repo_ctx["repo_path"] / "target"))
-                result = AGENT.run_task(
-                    task=task,
-                    session_id=session_id,
-                    prompt=prompt,
-                    system_instructions=system_prompt(task, granted, cwd, repo_ctx=repo_ctx, plan_only=plan_only),
-                    resume=resume,
-                    cwd=cwd,
-                    env_extra=extra_env,
-                    on_progress=progress,
-                    on_session_id=on_session_id,
-                    log_dir=LOGS_DIR,
-                    timeout=RUN_TIMEOUT,
-                    procs=_procs,
-                )
+            subtask_thread.start()
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    creds_env, cred_errors = credentials_for(granted, tmp)
+                    extra_env = dict(creds_env)
+                    if repo_ctx and SHARE_CARGO_TARGET and (cwd / "Cargo.toml").exists():
+                        extra_env.setdefault("CARGO_TARGET_DIR", str(repo_ctx["repo_path"] / "target"))
+                    result = AGENT.run_task(
+                        task=task,
+                        session_id=session_id,
+                        prompt=run_prompt,
+                        system_instructions=system_prompt(task, granted, cwd, repo_ctx=repo_ctx, plan_only=plan_only),
+                        resume=resume,
+                        cwd=cwd,
+                        env_extra=extra_env,
+                        on_progress=progress,
+                        on_session_id=on_session_id,
+                        log_dir=LOGS_DIR,
+                        timeout=RUN_TIMEOUT,
+                        procs=_procs,
+                        on_subtask=on_subtask,
+                    )
+            finally:
+                subtask_q.put(None)
+                subtask_thread.join(timeout=10)
             if result.session_id and not attached_session_id and new_session:
                 on_session_id(result.session_id)
 
@@ -1502,6 +1670,29 @@ def run_task(
             log.info("task %s: synced checklist %r (%d items)", task_id, cl_name, len(cl_items))
         except Exception:
             log.exception("task %s: syncing checklist %r failed", task_id, cl_name)
+
+    reply, attach_specs = extract_attachments(reply)
+    if attach_specs and cwd is not None:
+        uploaded_names: list[str] = []
+        attach_errors: list[str] = []
+        eff_sid = attached_session_id or session_id
+        for raw_path, disp_name in attach_specs:
+            resolved, err = resolve_attachable_path(raw_path, cwd, session_id=eff_sid)
+            if err or resolved is None:
+                attach_errors.append(err or f"`{raw_path}`: invalid")
+                continue
+            try:
+                att = BOARD.upload_attachment(task_id, resolved, name=disp_name)
+                if att:
+                    uploaded_names.append(att.name)
+                    log.info("task %s: uploaded attachment %r (%s)", task_id, att.name, resolved)
+            except Exception as e:
+                log.exception("task %s: uploading attachment %s failed", task_id, resolved)
+                attach_errors.append(f"`{resolved.name}`: upload failed ({e})")
+        if uploaded_names:
+            reply += "\n\n📎 Attached to card: " + ", ".join(f"`{n}`" for n in uploaded_names)
+        if attach_errors:
+            reply += "\n\n⚠️ Could not attach: " + "; ".join(attach_errors)
 
     if git_footer:
         reply += f"\n\n<sub>{git_footer}</sub>"
@@ -1604,7 +1795,9 @@ def build_dossier(task: Task, session_id: str, cwd: Path, repo_ctx: dict | None 
         files_heading = "\n## Changed / working-tree files"
     else:
         files = sorted(
-            str(p.relative_to(cwd)) for p in cwd.rglob("*") if p.is_file() and ".git" not in p.parts
+            str(p.relative_to(cwd))
+            for p in cwd.rglob("*")
+            if p.is_file() and ".git" not in p.parts and ATTACHMENTS_DIR_NAME not in p.parts
         )[:300]
         scope_header = f"\nTask directory (the ONLY place the agent may modify): {cwd}"
         files_heading = "\n## Files now in the task directory"

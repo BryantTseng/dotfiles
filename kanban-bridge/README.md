@@ -9,7 +9,7 @@ A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`**
 - **Live Board UI:** Self-hosted Planka v2 (`http://localhost:3000`) backed by PostgreSQL 16 with real-time WebSocket auto-refresh (no manual page reloads).
 - **Trigger:** Applying the **`agy`** label to any open card starts a headless `agy -p --output-format stream-json --sandbox` session in `~/workspace/kanban-tasks/task-<id>-<slug>/`.
 - **Session Persistence:** The `agy` `conversation_id` is stored invisibly at the bottom of the card description as `<!-- agy-session:<uuid> -->` (keeping Planka's label picker clean). Every human comment on the card resumes that exact session with `--conversation <uuid>`.
-- **Bot User:** Replies are posted as a dedicated Planka `boardUser` (**`agy`**) with `viewer` + `canComment: true` permissions.
+- **Bot User:** Card moves, live checklist updates, labels, and replies are performed as a dedicated Planka `boardUser` (**`agy`**, board `editor` role) so Planka's **Actions** feed cleanly separates **`Agy`**'s automated updates from your manual drags/edits.
 - **Columns (Board `Agy`):**
   1. **Backlog** — unscheduled ideas
   2. **To-Do** — ready / waiting (`⏳ Queued` comment if 2 slots are busy)
@@ -19,7 +19,12 @@ A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`**
   6. **Auditing** — **manual audit trigger**; drag any card here to run the read-only auditor (clean → **Pending**, problems → **Flagged**)
   7. **Done** *(closed list)* — **never entered automatically**; only moved here when you drag the card manually or comment `done` / `mark done` / `move to done` / `close` (0 tokens)
   8. **Flagged** — auditor found issues (`audit:<flag>` red labels + desktop notification)
-- **Native Planka Checklists (`CHECKLIST:`):** Agents can include `CHECKLIST: <Title>` blocks with `- [x]` / `- [ ]` items before `STATUS:`, which the bridge syncs to Planka's native Task Lists (`showOnFrontOfCard: true`) so you see progress right on the card face.
+- **Native Planka Checklists (`CHECKLIST:` + Live `Subagents & Tasks`):**
+  - **Live automatic tracking:** Whenever an agent spawns a subagent, swarm worker, workflow, or background command (`agy`: `invoke_subagent`, `swarm`, `run_workflow`, backgrounded `run_command`; `claude`: `Agent`/`Task`, `TodoWrite`), the bridge syncs each one live into a **`Subagents & Tasks`** Task List on the card (`showOnFrontOfCard: true`) and checks items off as they finish (or on clean turn completion).
+  - **Explicit `CHECKLIST:` blocks:** Agents can also include `CHECKLIST: <Title>` blocks with `- [x]` / `- [ ]` items before `STATUS:` to sync deliverables/follow-ups onto the card face.
+- **Two-Way Planka Attachments (Images & Files):**
+  - **Inbound (Planka → Agent):** Before every run, any files/images attached to the card are downloaded into `<task-dir>/.kanban-attachments/` (excluded from git via `.git/info/exclude`) and listed in the prompt so the agent can inspect screenshots, PDFs, or logs directly.
+  - **Outbound (Agent → Planka):** When you ask the agent to generate an image, diagram, or file, it emits `ATTACH: <path>` (or `ATTACH: <path> | <title>`) before `STATUS:`, and the bridge uploads the file directly onto the card as **`Agy`** (validating workspace/session boundaries and blocking sensitive files like `.env` / `*.pem`).
 - **Pre-Run Intake (`⚙️ Configure this run` — 0 tokens):** When a brand-new `agy` card doesn't yet specify both a workspace choice (`worktree` / `in-place` / `scratch`) and execution mode (`plan-first` / `direct`), the bridge posts a signed 1-click setup form link (`http://localhost:8787/setup?...`) on the card (plus comment-reply shortcuts like `clerk worktree plan-first`) and moves it to **Need Action** before spending any agent tokens. Cards that already have those labels start immediately.
 - **Git Tracking & Isolated Repos (`~/workspace/kanban-bridge/repos/`):**
   - **Standalone scratch cards (`scratch`):** Each card gets its own git repo in `~/workspace/kanban-tasks/task-<id>-<slug>/` (one commit per run).

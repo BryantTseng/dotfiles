@@ -74,6 +74,18 @@ class Task:
 
 
 @dataclass
+class Attachment:
+    id: str
+    name: str
+    kind: str = "file"  # "file" | "link"
+    url: str = ""
+    mime_type: str = ""
+    size_bytes: int = 0
+    is_image: bool = False
+    local_path: Path | None = None
+
+
+@dataclass
 class WebhookEvent:
     event_type: str  # "task.created" | "task.updated" | "task.comment.created"
     task_id: str
@@ -171,6 +183,18 @@ class BoardProvider(ABC):
         """Create or update a named checklist (`[(text, is_completed), ...]`) on a card."""
         return None
 
+    def sync_attachments_in(
+        self, task_id: str, dest_dir: Path, max_bytes: int = 25 * 1024 * 1024
+    ) -> list[Attachment]:
+        """Download file attachments on `task_id` into `dest_dir` and return attachment metadata."""
+        return []
+
+    def upload_attachment(
+        self, task_id: str, file_path: Path, name: str | None = None
+    ) -> Attachment | None:
+        """Upload a local file as a native attachment on `task_id`."""
+        return None
+
 
 class AgentProvider(ABC):
     """Abstract interface for an AI coding agent runtime (Agy, Claude Code, etc.)."""
@@ -193,6 +217,7 @@ class AgentProvider(ABC):
         log_dir: Path,
         timeout: int,
         procs: set,
+        on_subtask: Callable[[str, str, bool], None] | None = None,
     ) -> AgentResult:
         """Run one agent turn on `task` inside `cwd`."""
 

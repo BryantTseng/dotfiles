@@ -83,7 +83,7 @@ $KANBAN delete <card_id>
 - **API:** `http://localhost:3000/api` (`X-Api-Key`)
 - **Project:** `Agy` (`1916814609407280132`), **Board:** `Agy` (`1916814609835099142`)
 - **Trigger label:** `agy` (`1916814904292017170`)
-- **Bot user:** `agy` (`1916814609130456067`, role `viewer` + `canComment: true`)
+- **Bot user:** `agy` (`1916814609130456067`, board `editor` role — handles moves, checklists, labels, and comments)
 - **Compose stack:** `~/workspace/kanban-bridge/planka/docker-compose.yml` (`planka` + `planka-postgres` on `127.0.0.1:5433`)
 
 | Order | List | List ID | Role |
@@ -105,6 +105,8 @@ $KANBAN delete <card_id>
   - Scratch cards: `~/workspace/kanban-tasks/task-<id>-<slug>/`
   - Repo-backed cards (`repo:<name>` + `worktree` or `in-place`): isolated `git worktree` at `~/workspace/kanban-tasks/<repo>-task-<id>-<slug>/` on branch `kanban/<id-tail>-<slug>` with shared `CARGO_TARGET_DIR` (clean up after PR merge with `git -C ~/workspace/kanban-bridge/repos/<repo> worktree remove <path>`).
 - **Plan-first workflow:** Attach `plan-first` to run spec/Q&A first without modifying production code; replying `do it` / `proceed` automatically removes `plan-first` and unlocks implementation.
+- **Live Task Lists (`Subagents & Tasks`):** Subagents, swarm workers, workflows, backgrounded commands (`agy`), and `Agent`/`Task`/`TodoWrite` calls (`claude`) automatically stream live into a native `Subagents & Tasks` checklist on the card (`showOnFrontOfCard: true`) and check off when finished.
+- **Two-Way Card Attachments:** Card attachments are auto-downloaded into `<task-dir>/.kanban-attachments/` (git-excluded) before each run so agents can inspect images/PDFs/files; agents can emit `ATTACH: <path>` to upload generated images/files directly onto the card as `Agy`.
 - **Host audit logs:** `~/.local/share/kanban-bridge/logs/<conversation-id>.jsonl`
 - **Service commands:**
   ```bash

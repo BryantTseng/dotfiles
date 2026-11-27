@@ -22,7 +22,7 @@ from providers import (
 )
 from providers.agy import AgyAgent
 from providers.claude import ClaudeAgent, _worktree_git_mount
-from providers.planka import SESSION_TAG_RE
+from providers.planka import PlankaBoard, SESSION_TAG_RE, _encode_multipart
 
 
 class TestProviderLoadingAndRegistry(unittest.TestCase):
@@ -182,6 +182,99 @@ class TestClaudeAgent(unittest.TestCase):
             self.assertIn("- Read:", calls[0])
             self.assertIn("- Bash [ERROR/DENIED]:", calls[1])
 
+    def test_live_subtask_sync_for_agents_and_todowrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            events = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu_agent_ok",
+                                "name": "Agent",
+                                "input": {"description": "Check auth flow", "subagent_type": "Explore"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "tu_agent_err",
+                                "name": "Task",
+                                "input": {"description": "Explore flaky check", "subagent_type": "Explore"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "tu_todo_1",
+                                "name": "TodoWrite",
+                                "input": {
+                                    "todos": [
+                                        {"content": "Write tests", "status": "in_progress"},
+                                        {"content": "Update docs", "status": "pending"},
+                                    ]
+                                },
+                            },
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "tu_agent_ok", "is_error": False},
+                            {"type": "tool_result", "tool_use_id": "tu_agent_err", "is_error": True},
+                        ]
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu_todo_2",
+                                "name": "TodoWrite",
+                                "input": {
+                                    "todos": [
+                                        {"content": "Write tests", "status": "completed"},
+                                        {"content": "Update docs", "status": "pending"},
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                },
+                {"type": "result", "subtype": "success", "is_error": False, "result": "Done.\nSTATUS: DONE"},
+            ]
+            fake_cmd = [
+                sys.executable,
+                "-c",
+                "import sys; print(" + repr("\n".join(json.dumps(e) for e in events)) + ")",
+            ]
+            captured: list[tuple[str, str, bool]] = []
+            agent = ClaudeAgent(claude_bin=sys.executable, mode="host", base_env={})
+            res = agent._run_streaming(
+                cmd=fake_cmd,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_path=tmp_path / "s.jsonl",
+                session_id="s",
+                on_subtask=lambda cl, text, done: captured.append((cl, text, done)),
+            )
+            self.assertFalse(res.is_error)
+            self.assertEqual(
+                captured,
+                [
+                    ("Subagents & Tasks", "[subagent] Check auth flow (Explore)", False),
+                    ("Subagents & Tasks", "[subagent] Explore flaky check", False),
+                    ("Subagents & Tasks", "Write tests", False),
+                    ("Subagents & Tasks", "Update docs", False),
+                    ("Subagents & Tasks", "[subagent] Check auth flow (Explore)", True),
+                    ("Subagents & Tasks", "Write tests", True),
+                ],
+            )
+
 
 class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
     def test_agy_strips_intermediate_background_wait_chatter(self):
@@ -247,6 +340,142 @@ class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
             self.assertNotIn("waiting for build to finish", res.text)
             self.assertEqual(res.text, "Implemented the Rust notifier.\nSTATUS: DONE")
 
+    def test_agy_live_subtask_sync_on_success_and_error(self):
+        def _step(
+            idx: int,
+            name: str,
+            state: str,
+            params: dict | None = None,
+            output: str = "",
+            step_type: str = "tool",
+            duration: float | None = None,
+            subagent_info: dict | None = None,
+        ) -> dict:
+            su: dict = {
+                "conversation_id": "conv-sub",
+                "step_index": idx,
+                "state": state,
+                "step_type": step_type,
+                "tool_name": name,
+            }
+            if params is not None or output:
+                su["tool_info"] = {"name": name, "parameters": params or {}, "output": output}
+            if duration is not None:
+                su["duration_seconds"] = duration
+            if subagent_info is not None:
+                su["subagent_info"] = subagent_info
+            return {"event": "step_update", "step_update": su}
+
+        base_events = [
+            {"event": "init", "conversation_id": "conv-sub"},
+            # Real agy stream-json schema for invoke_subagent: step_type="subagent" + subagent_info
+            _step(
+                1,
+                "invoke_subagent",
+                "ACTIVE",
+                step_type="subagent",
+                subagent_info={
+                    "subagents": [
+                        {"type_name": "research", "role": "Codebase Researcher"},
+                        {"type_name": "self", "role": "API Auditor"},
+                    ]
+                },
+            ),
+            _step(2, "swarm", "ACTIVE", {"action": "add", "name": "dev", "model": "medium", "n": 2}),
+            _step(3, "swarm", "ACTIVE", {"action": "kill", "name": "dev-1"}),
+            _step(4, "run_workflow", "ACTIVE", {"Description": "Fan out lint checks"}),
+            _step(4, "run_workflow", "DONE", {"Description": "Fan out lint checks"}, output="All checks passed"),
+            # Fast command (<2s): should NOT appear in checklist
+            _step(5, "run_command", "ACTIVE", {"CommandLine": "git status"}),
+            _step(5, "run_command", "DONE", {"CommandLine": "git status"}, output="Command exited with code 0.", duration=0.3),
+            # Long/backgrounded command (>=2s, exit 0): appears and marks checked
+            _step(6, "run_command", "ACTIVE", {"CommandLine": "sleep 2 && echo bg-ok"}),
+            _step(6, "run_command", "DONE", {"CommandLine": "sleep 2 && echo bg-ok"}, output="Command exited with code 0.\nbg-ok", duration=4.28),
+            # Failed long command (exit 101): stays unchecked even on SUCCESS
+            _step(7, "run_command", "ACTIVE", {"CommandLine": "cargo test --broken"}),
+            _step(7, "run_command", "DONE", {"CommandLine": "cargo test --broken"}, output="Command exited with code 101.", duration=12.5),
+            # Explicit background task output
+            _step(
+                8,
+                "run_command",
+                "DONE",
+                {"toolSummary": "Cargo test build", "CommandLine": "cargo test"},
+                output="Tool is running as a background task (id: bg-1)",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            agent = AgyAgent(agy_bin=sys.executable, base_env={})
+
+            # 1) Clean SUCCESS auto-completes remaining non-failed subtasks
+            ok_events = base_events + [
+                {"event": "result", "result": {"conversation_id": "conv-sub", "status": "SUCCESS", "response": "Done"}}
+            ]
+            ok_cmd = [sys.executable, "-c", "print(" + repr("\n".join(json.dumps(e) for e in ok_events)) + ")"]
+            ok_captured: list[tuple[str, str, bool]] = []
+            res_ok = agent._run_streaming(
+                cmd=ok_cmd,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_dir=tmp_path,
+                on_subtask=lambda cl, text, done: ok_captured.append((cl, text, done)),
+            )
+            self.assertFalse(res_ok.is_error)
+            self.assertEqual(
+                ok_captured,
+                [
+                    ("Subagents & Tasks", "[subagent] Codebase Researcher", False),
+                    ("Subagents & Tasks", "[subagent] API Auditor (self)", False),
+                    ("Subagents & Tasks", "[swarm] dev-1 (medium)", False),
+                    ("Subagents & Tasks", "[swarm] dev-2 (medium)", False),
+                    ("Subagents & Tasks", "[swarm] dev-1 (medium)", True),
+                    ("Subagents & Tasks", "[workflow] Fan out lint checks", False),
+                    ("Subagents & Tasks", "[workflow] Fan out lint checks", True),
+                    ("Subagents & Tasks", "[cmd] sleep 2 && echo bg-ok", True),
+                    ("Subagents & Tasks", "[cmd] cargo test --broken", False),
+                    ("Subagents & Tasks", "[cmd] Cargo test build", False),
+                    ("Subagents & Tasks", "[subagent] Codebase Researcher", True),
+                    ("Subagents & Tasks", "[subagent] API Auditor (self)", True),
+                    ("Subagents & Tasks", "[swarm] dev-2 (medium)", True),
+                    ("Subagents & Tasks", "[cmd] Cargo test build", True),
+                ],
+            )
+
+            # 2) Non-SUCCESS status leaves still-open subtasks unchecked
+            err_events = base_events + [
+                {"event": "result", "result": {"conversation_id": "conv-sub", "status": "ERROR", "error": "boom"}}
+            ]
+            err_cmd = [sys.executable, "-c", "print(" + repr("\n".join(json.dumps(e) for e in err_events)) + ")"]
+            err_captured: list[tuple[str, str, bool]] = []
+            res_err = agent._run_streaming(
+                cmd=err_cmd,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_dir=tmp_path,
+                on_subtask=lambda cl, text, done: err_captured.append((cl, text, done)),
+            )
+            self.assertTrue(res_err.is_error)
+            self.assertEqual(
+                err_captured,
+                [
+                    ("Subagents & Tasks", "[subagent] Codebase Researcher", False),
+                    ("Subagents & Tasks", "[subagent] API Auditor (self)", False),
+                    ("Subagents & Tasks", "[swarm] dev-1 (medium)", False),
+                    ("Subagents & Tasks", "[swarm] dev-2 (medium)", False),
+                    ("Subagents & Tasks", "[swarm] dev-1 (medium)", True),
+                    ("Subagents & Tasks", "[workflow] Fan out lint checks", False),
+                    ("Subagents & Tasks", "[workflow] Fan out lint checks", True),
+                    ("Subagents & Tasks", "[cmd] sleep 2 && echo bg-ok", True),
+                    ("Subagents & Tasks", "[cmd] cargo test --broken", False),
+                    ("Subagents & Tasks", "[cmd] Cargo test build", False),
+                ],
+            )
+
     def test_extract_checklists_and_done_command_regex(self):
         import os
         os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
@@ -280,6 +509,74 @@ class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
         for no_msg in ("done with step 1, now add tests", "not done yet", "close the modal after click"):
             self.assertIsNone(bridge.DONE_CMD_RE.match(no_msg), f"should NOT match: {no_msg!r}")
 
+    def test_extract_attachments_and_path_validation(self):
+        import os
+        os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+        import bridge
+
+        raw = (
+            "Here is the chart and example:\n\n"
+            "```markdown\n"
+            "ATTACH: example_inside_code_block.png\n"
+            "```\n\n"
+            "ATTACH: `out/diagram.png` | Architecture Diagram\n"
+            "ATTACH: report.txt\n"
+            "All done."
+        )
+        cleaned, specs = bridge.extract_attachments(raw)
+        self.assertEqual(
+            specs,
+            [
+                ("out/diagram.png", "Architecture Diagram"),
+                ("report.txt", None),
+            ],
+        )
+        self.assertIn("ATTACH: example_inside_code_block.png", cleaned)
+        self.assertNotIn("ATTACH: report.txt", cleaned)
+        self.assertIn("All done.", cleaned)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            cwd = root / "task"
+            (cwd / "out").mkdir(parents=True)
+            (cwd / ".git").mkdir()
+            ok_file = cwd / "out" / "diagram.png"
+            ok_file.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+            env_file = cwd / ".env"
+            env_file.write_text("SECRET=1", encoding="utf-8")
+            pem_file = cwd / "private.pem"
+            pem_file.write_text("key", encoding="utf-8")
+            git_file = cwd / ".git" / "config"
+            git_file.write_text("git", encoding="utf-8")
+            outside = root / "outside.txt"
+            outside.write_text("nope", encoding="utf-8")
+
+            res, err = bridge.resolve_attachable_path("out/diagram.png", cwd)
+            self.assertIsNone(err)
+            self.assertEqual(res, ok_file)
+
+            res, err = bridge.resolve_attachable_path(f"file://{ok_file}", cwd)
+            self.assertIsNone(err)
+            self.assertEqual(res, ok_file)
+
+            for bad in ("../outside.txt", ".env", "private.pem", ".git/config", "missing.png"):
+                res, err = bridge.resolve_attachable_path(bad, cwd)
+                self.assertIsNone(res, f"should reject {bad}")
+                self.assertIsNotNone(err)
+
+        body, ctype = _encode_multipart(
+            fields=[("type", "file"), ("name", "chart.png")],
+            file_field="file",
+            filename="chart.png",
+            content_type="image/png",
+            data=b"\x89PNGDATA",
+        )
+        self.assertIn("multipart/form-data; boundary=", ctype)
+        # Sails/Skipper requires text fields before file payload
+        self.assertLess(body.index(b'name="type"'), body.index(b'name="file"'))
+        self.assertLess(body.index(b'name="name"'), body.index(b'name="file"'))
+        self.assertIn(b"\x89PNGDATA", body)
+
 
 class TestPlankaSessionTagCompat(unittest.TestCase):
     def test_session_tag_matches_agy_claude_and_kanban(self):
@@ -287,6 +584,100 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
             m = SESSION_TAG_RE.search(f"Body text\n\n<!-- {prefix}-session:abc-123 -->")
             self.assertIsNotNone(m, f"failed for prefix {prefix}")
             self.assertEqual(m.group(1), "abc-123")
+
+    def test_bot_api_key_used_for_moves_checklists_and_ignores_self_echo(self):
+        board = PlankaBoard(
+            base_url="http://127.0.0.1:3000",
+            api_key="admin-key",
+            webhook_url="http://127.0.0.1:8787/planka",
+            webhook_secret="sec",
+            bot_api_key="bot-key",
+            bot_username="agy",
+        )
+        calls: list[tuple[str, str, str | None]] = []
+
+        def fake_api(method: str, path: str, payload=None, *, api_key=None):
+            calls.append((method, path, api_key))
+            if path == "/boards/b1":
+                return {"included": {"lists": [{"id": "l2", "name": "Pending", "type": "active"}]}}
+            if path == "/cards/c1" and method == "GET":
+                return {"item": {"id": "c1", "boardId": "b1", "description": "hi"}, "included": {"taskLists": [], "tasks": []}}
+            if path == "/cards/c1/task-lists":
+                return {"item": {"id": "tl1", "name": "Subagents & Tasks"}}
+            if path == "/task-lists/tl1/tasks":
+                return {"item": {"id": "t1", "name": "[subagent] x", "isCompleted": False}}
+            return {"item": {}}
+
+        board._api = fake_api  # type: ignore[method-assign]
+        t = Task(id="c1", title="Card", project_id="b1")
+        self.assertTrue(board.move_to(t, "Pending"))
+        board.sync_checklist("c1", "Subagents & Tasks", [("[subagent] x", False)])
+        board.attach_session_label("c1", "sess-1", "session:", "grey")
+
+        mut_keys = {k for m, _, k in calls if m in ("POST", "PATCH", "DELETE")}
+        self.assertEqual(mut_keys, {"bot-key"})
+
+        # Bot self-echo cardUpdate is ignored; human cardUpdate is processed
+        bot_ev = board.parse_webhook(
+            {"authorization": "Bearer sec"},
+            json.dumps({"event": "cardUpdate", "data": {"item": {"id": "c1"}}, "user": {"username": "agy"}}).encode(),
+        )
+        self.assertIsNone(bot_ev)
+        human_ev = board.parse_webhook(
+            {"authorization": "Bearer sec"},
+            json.dumps({"event": "cardUpdate", "data": {"item": {"id": "c1"}}, "user": {"username": "bryant"}}).encode(),
+        )
+        self.assertIsNotNone(human_ev)
+        assert human_ev is not None
+        self.assertEqual(human_ev.task_id, "c1")
+
+    def test_planka_upload_attachment_url_and_headers(self):
+        import io
+        from unittest import mock
+
+        board = PlankaBoard(
+            base_url="http://127.0.0.1:3000",
+            api_key="admin-key",
+            webhook_url="http://127.0.0.1:8787/planka",
+            webhook_secret="sec",
+            bot_api_key="bot-key",
+            bot_username="agy",
+        )
+        seen_req = []
+
+        class _FakeResp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=60):
+            seen_req.append(req)
+            return _FakeResp(
+                json.dumps(
+                    {
+                        "item": {
+                            "id": "att1",
+                            "name": "Badge",
+                            "type": "file",
+                            "data": {"url": "http://localhost:3000/attachments/att1/download/badge.png", "mimeType": "image/png", "sizeInBytes": 8, "image": {"width": 1, "height": 1}},
+                        }
+                    }
+                ).encode()
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "badge.png"
+            p.write_bytes(b"\x89PNGDATA")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                att = board.upload_attachment("c1", p, name="Badge")
+            self.assertIsNotNone(att)
+            assert att is not None
+            self.assertEqual(att.id, "att1")
+            self.assertTrue(att.is_image)
+            self.assertEqual(seen_req[0].full_url, "http://127.0.0.1:3000/api/cards/c1/attachments")
+            self.assertEqual(seen_req[0].headers.get("X-api-key"), "bot-key")
 
 
 if __name__ == "__main__":

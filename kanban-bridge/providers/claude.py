@@ -55,6 +55,7 @@ BRIDGE_SECRET_KEYS = {
 }
 
 PROGRESS_EVERY = 30
+SUBTASK_LIST = "Subagents & Tasks"
 
 
 def _describe_tool(item: dict) -> str:
@@ -218,6 +219,7 @@ class ClaudeAgent(AgentProvider):
         procs: set,
         stdin_text: str | None = None,
         on_progress: Callable[[int, int, str], None] | None = None,
+        on_subtask: Callable[[str, str, bool], None] | None = None,
         log_path: Path | None = None,
         container: str | None = None,
         session_id: str | None = None,
@@ -226,6 +228,13 @@ class ClaudeAgent(AgentProvider):
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_file = open(log_path, "a", encoding="utf-8")
+
+        def emit_subtask(item_text: str, is_completed: bool) -> None:
+            if on_subtask and item_text:
+                try:
+                    on_subtask(SUBTASK_LIST, item_text, is_completed)
+                except Exception:
+                    log.warning("on_subtask callback failed", exc_info=True)
 
         with tempfile.TemporaryFile("w+", encoding="utf-8") as err:
             # Own session: Ctrl-C in the bridge terminal must not kill running jobs directly.
@@ -257,7 +266,15 @@ class ClaudeAgent(AgentProvider):
             steps = 0
             last_step: str | None = None
             result_ev: dict | None = None
+            subagent_by_id: dict[str, str] = {}  # tool_use_id -> item label
+            subtask_state: dict[str, bool] = {}  # item_text -> is_completed
             stop_ticker = threading.Event()
+
+            def track_subtask(label: str, done: bool) -> None:
+                if subtask_state.get(label) == done:
+                    return
+                subtask_state[label] = done
+                emit_subtask(label, done)
 
             def ticker():
                 while not stop_ticker.wait(PROGRESS_EVERY):
@@ -285,6 +302,27 @@ class ClaudeAgent(AgentProvider):
                             if item.get("type") == "tool_use":
                                 steps += 1
                                 last_step = _describe_tool(item)
+                                tname = str(item.get("name") or "")
+                                inp = item.get("input") or {}
+                                tid = str(item.get("id") or "")
+                                if tname in ("Agent", "Task"):
+                                    desc = str(inp.get("description") or inp.get("subagent_type") or "subagent").strip()
+                                    stype = str(inp.get("subagent_type") or "").strip()
+                                    label = f"[subagent] {desc[:120]}" + (f" ({stype})" if stype and stype.lower() not in desc.lower() else "")
+                                    if tid:
+                                        subagent_by_id[tid] = label[:160]
+                                    track_subtask(label[:160], False)
+                                elif tname == "TodoWrite":
+                                    for todo in inp.get("todos") or []:
+                                        content = str(todo.get("content") or "").strip()
+                                        if content:
+                                            track_subtask(content[:160], str(todo.get("status") or "").lower() == "completed")
+                    elif ev_type == "user":
+                        for item in (ev.get("message") or {}).get("content") or []:
+                            if item.get("type") == "tool_result":
+                                tid = str(item.get("tool_use_id") or "")
+                                if tid in subagent_by_id and not item.get("is_error"):
+                                    track_subtask(subagent_by_id.pop(tid), True)
                     elif ev_type == "result":
                         result_ev = ev
                 p.wait()
@@ -435,6 +473,7 @@ class ClaudeAgent(AgentProvider):
         log_dir: Path,
         timeout: int,
         procs: set,
+        on_subtask: Callable[[str, str, bool], None] | None = None,
     ) -> AgentResult:
         sid = session_id or str(uuid.uuid4())
         if not resume and on_session_id:
@@ -453,6 +492,7 @@ class ClaudeAgent(AgentProvider):
                 timeout=timeout,
                 procs=procs,
                 on_progress=on_progress,
+                on_subtask=on_subtask,
                 log_path=log_path,
                 session_id=sid,
             )
@@ -488,6 +528,7 @@ class ClaudeAgent(AgentProvider):
                     timeout=timeout,
                     procs=procs,
                     on_progress=on_progress,
+                    on_subtask=on_subtask,
                     log_path=log_path,
                     container=container,
                     session_id=sid,
