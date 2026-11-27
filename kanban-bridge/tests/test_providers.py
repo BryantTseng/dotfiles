@@ -1542,6 +1542,33 @@ class TestOpenCodeAgent(unittest.TestCase):
         for secret in ("PLANKA_API_KEY", "WEBHOOK_SECRET", "CLAUDE_OAUTH_TOKEN"):
             self.assertNotIn(secret, agent.base_env)
 
+    def test_opencode_worker_model_loaded_from_env(self):
+        from providers.opencode import OpenCodeAgent
+
+        agent = load_agent_provider(
+            "opencode", {"BRIDGE_WORKER_MODEL": "openrouter/mistralai/devstral-2512"}
+        )
+        self.assertIsInstance(agent, OpenCodeAgent)
+        self.assertEqual(agent.worker_model, "openrouter/mistralai/devstral-2512")
+
+    def test_opencode_worker_model_pins_builtin_subagents(self):
+        from providers.opencode import AUDIT_PERMISSION_CONFIG, TASK_PERMISSION_CONFIG, OpenCodeAgent
+
+        worker_model = "openrouter/mistralai/devstral-2512"
+        agent = OpenCodeAgent(
+            opencode_bin="opencode", base_env={}, worker_model=worker_model
+        )
+        cfg = json.loads(agent._config_content(TASK_PERMISSION_CONFIG))
+        self.assertEqual(cfg["permission"], "allow")
+        for name in ("general", "explore"):
+            self.assertEqual(cfg["agents"][name]["model"], worker_model)
+        audit_cfg = json.loads(agent._config_content(AUDIT_PERMISSION_CONFIG))
+        self.assertEqual(audit_cfg["permission"]["*"], "deny")
+        self.assertEqual(audit_cfg["agents"]["general"]["model"], worker_model)
+
+        plain = OpenCodeAgent(opencode_bin="opencode", base_env={})
+        self.assertNotIn("agents", json.loads(plain._config_content(TASK_PERMISSION_CONFIG)))
+
     def test_opencode_streaming_subtasks_audit_and_usage(self):
         from providers.opencode import AUDIT_PERMISSION_CONFIG, OpenCodeAgent, TASK_PERMISSION_CONFIG
 

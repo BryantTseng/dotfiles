@@ -6,6 +6,8 @@ Runs `opencode run --format json` in headless mode on the host:
   - Persists session IDs (`ses_...`) via `--session <id>` for multi-turn card conversations.
   - Supports OpenRouter models natively via `OPENROUTER_API_KEY` and
     `BRIDGE_OPENCODE_MODEL=openrouter/<vendor>/<model>` (or any provider configured in OpenCode).
+  - `BRIDGE_ORCHESTRATOR_MODEL`, `BRIDGE_AUDITOR_MODEL` and `BRIDGE_WORKER_MODEL`
+    pin the coordinator, auditor and built-in subagent models independently.
   - Uses `OPENCODE_CONFIG_CONTENT` to auto-allow tool execution headlessly in `run_task` and
     enforce strict read-only permissions (`edit`/`write`/`bash` denied) in `run_audit`.
   - Runs agent subprocesses in their own session (`start_new_session=True`) so Ctrl-C drains
@@ -51,6 +53,10 @@ BRIDGE_SECRET_KEYS = {
 
 PROGRESS_EVERY = 30
 SUBTASK_LIST = "Subagents & Tasks"
+
+# OpenCode's built-in subagents (used by orchestrator cards) get their model
+# from the agent config, not from `opencode run --model`.
+WORKER_AGENTS = ("general", "explore")
 
 TASK_PERMISSION_CONFIG = json.dumps(
     {
@@ -144,12 +150,14 @@ class OpenCodeAgent(AgentProvider):
         model: str | None = None,
         agent_name: str | None = None,
         auditor_model: str | None = None,
+        worker_model: str | None = None,
         base_env: dict[str, str],
     ):
         self.opencode_bin = opencode_bin
         self.model = model or None
         self.agent_name = agent_name or None
         self.auditor_model = auditor_model or model or None
+        self.worker_model = worker_model or None
         self.base_env = base_env
 
     @classmethod
@@ -170,8 +178,18 @@ class OpenCodeAgent(AgentProvider):
             model=env.get("BRIDGE_OPENCODE_MODEL"),
             agent_name=env.get("BRIDGE_OPENCODE_AGENT"),
             auditor_model=env.get("BRIDGE_AUDITOR_MODEL"),
+            worker_model=env.get("BRIDGE_WORKER_MODEL"),
             base_env=base,
         )
+
+    def _config_content(self, base: str | dict) -> str:
+        """Build OPENCODE_CONFIG_CONTENT, pinning subagent models when configured."""
+        cfg = json.loads(base) if isinstance(base, str) else dict(base)
+        if self.worker_model:
+            cfg["agents"] = {
+                name: {"model": self.worker_model} for name in WORKER_AGENTS
+            }
+        return json.dumps(cfg)
 
     def _build_cmd(
         self,
@@ -447,7 +465,7 @@ class OpenCodeAgent(AgentProvider):
             agent_name=self.agent_name,
         )
         env = {**self.base_env, "GIT_TERMINAL_PROMPT": "0", **env_extra}
-        env.setdefault("OPENCODE_CONFIG_CONTENT", TASK_PERMISSION_CONFIG)
+        env.setdefault("OPENCODE_CONFIG_CONTENT", self._config_content(TASK_PERMISSION_CONFIG))
         log.info(
             "task %s: running opencode (%s) in %s",
             task.id,
@@ -485,7 +503,7 @@ class OpenCodeAgent(AgentProvider):
         env = {
             **self.base_env,
             "GIT_TERMINAL_PROMPT": "0",
-            "OPENCODE_CONFIG_CONTENT": AUDIT_PERMISSION_CONFIG,
+            "OPENCODE_CONFIG_CONTENT": self._config_content(AUDIT_PERMISSION_CONFIG),
         }
         res = self._run_streaming(
             cmd=cmd,
