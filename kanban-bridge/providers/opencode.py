@@ -62,6 +62,15 @@ TASK_PERMISSION_CONFIG = json.dumps(
     {
         "$schema": "https://opencode.ai/config.json",
         "permission": "allow",
+        "providers": {
+            "openrouter": {
+                "models": {
+                    "deepseek/deepseek-v4.1-flash": {
+                        "body": {"provider": {"zdr": True}},
+                    },
+                },
+            },
+        },
     }
 )
 
