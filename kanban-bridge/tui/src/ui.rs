@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_cards(f, app, panes[1]);
     draw_detail(f, app, panes[2]);
 
-    let keys = "h/l column  j/k card  o open  r refresh  q quit";
+    let keys = "←/→ or h/l column  ↑/↓ or j/k card  o open  r refresh  q quit";
     f.render_widget(Paragraph::new(keys).dark_gray(), footer);
 }
 
