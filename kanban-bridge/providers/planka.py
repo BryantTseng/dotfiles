@@ -45,6 +45,7 @@ HEX_TO_PLANKA_COLOR = {
     "1e88e5": "antique-blue",    # repo:*
     "fb8c00": "pumpkin-orange",  # in-place
     "43a047": "sunny-grass",     # direct
+    "00acc1": "sky-blue",        # model:*
 }
 
 
@@ -412,12 +413,15 @@ class PlankaBoard(BoardProvider):
             if e.code != 409:  # already attached
                 raise
 
-    def attach_session_label(self, task_id: str, session_id: str, prefix: str, color: str) -> None:
+    def attach_session_label(
+        self, task_id: str, session_id: str, prefix: str, color: str, provider: str = "agy"
+    ) -> None:
         """Store session ID as an invisible Markdown comment in card description."""
         card = (self._api("GET", f"/cards/{task_id}") or {})["item"]
         desc = (card.get("description") or "").rstrip()
         desc = SESSION_TAG_RE.sub("", desc).rstrip()
-        tag = f"<!-- agy-session:{session_id} -->"
+        marker = provider if provider in ("agy", "claude", "kanban") else "kanban"
+        tag = f"<!-- {marker}-session:{session_id} -->"
         new_desc = f"{desc}\n\n{tag}" if desc else tag
         self._api("PATCH", f"/cards/{task_id}", {"description": new_desc}, api_key=self.bot_api_key)
 

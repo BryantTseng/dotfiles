@@ -14,7 +14,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from providers import (
+    Attachment,
+    ModelUsage,
     Task,
+    estimate_model_cost_usd,
+    format_usage_summary,
     is_valid_proxy_token,
     load_agent_provider,
     register_proxy_token,
@@ -678,6 +682,538 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
             self.assertTrue(att.is_image)
             self.assertEqual(seen_req[0].full_url, "http://127.0.0.1:3000/api/cards/c1/attachments")
             self.assertEqual(seen_req[0].headers.get("X-api-key"), "bot-key")
+
+    def test_provider_specific_session_marker(self):
+        board = PlankaBoard(
+            base_url="http://127.0.0.1:3000",
+            api_key="admin-key",
+            webhook_url="http://127.0.0.1:8787/planka",
+            webhook_secret="sec",
+            bot_api_key="bot-key",
+            bot_username="claude",
+        )
+        patched_descs: list[str] = []
+
+        def fake_api(method: str, path: str, payload=None, *, api_key=None):
+            if method == "GET":
+                return {"item": {"id": "c1", "description": "Card body"}}
+            if method == "PATCH":
+                patched_descs.append(payload["description"])
+                return {"item": {}}
+            return {}
+
+        board._api = fake_api  # type: ignore[method-assign]
+        board.attach_session_label("c1", "sess-claude", "session:", "grey", provider="claude")
+        board.attach_session_label("c1", "sess-agy", "session:", "grey", provider="agy")
+        self.assertEqual(patched_descs[0], "Card body\n\n<!-- claude-session:sess-claude -->")
+        self.assertEqual(patched_descs[1], "Card body\n\n<!-- agy-session:sess-agy -->")
+
+
+class TestCrossPlatformWorkdirBacklogAndSubagentAudits(unittest.TestCase):
+    def test_agent_workdir_for_agy_and_claude_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            scratch = root / "scratch"
+            scratch.mkdir()
+
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-q", "-m", "init"],
+                cwd=repo,
+                check=True,
+            )
+            wt = root / "wt"
+            subprocess.run(["git", "-C", str(repo), "worktree", "add", "-b", "feat/wt", str(wt)], capture_output=True, check=True)
+
+            agy = AgyAgent(agy_bin=sys.executable, base_env={})
+            self.assertEqual(agy.agent_workdir(scratch), scratch)
+
+            claude_host = ClaudeAgent(claude_bin=sys.executable, mode="host", base_env={})
+            self.assertEqual(claude_host.agent_workdir(scratch), scratch)
+
+            claude_docker = ClaudeAgent(claude_bin=sys.executable, mode="docker", base_env={})
+            self.assertEqual(claude_docker.agent_workdir(scratch), Path("/work"))
+            self.assertEqual(claude_docker.agent_workdir(wt), wt)
+
+    def test_docker_workdir_mapping_for_inbound_and_outbound_attachments(self):
+        import os
+
+        os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+        import bridge
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            cwd = root / "task"
+            (cwd / "out").mkdir(parents=True)
+            (cwd / ".kanban-attachments").mkdir(parents=True)
+            chart = cwd / "out" / "chart.png"
+            chart.write_bytes(b"\x89PNGDATA")
+            inbound = cwd / ".kanban-attachments" / "123456-spec.png"
+            inbound.write_bytes(b"\x89PNGIN")
+            outside = root / "secret.txt"
+            outside.write_text("nope", encoding="utf-8")
+
+            # Container path `/work/out/chart.png` maps cleanly to host `cwd/out/chart.png`
+            res, err = bridge.resolve_attachable_path("/work/out/chart.png", cwd, agent_cwd=Path("/work"))
+            self.assertIsNone(err)
+            self.assertEqual(res, chart)
+
+            # Traversal climbing out of `/work` is still rejected
+            res, err = bridge.resolve_attachable_path("/work/../secret.txt", cwd, agent_cwd=Path("/work"))
+            self.assertIsNone(res)
+            self.assertIsNotNone(err)
+
+            # Inbound prompt block renders `/work/.kanban-attachments/...` in Docker mode
+            block = bridge.format_inbound_attachments(
+                [Attachment(id="1", name="spec.png", kind="file", is_image=True, size_bytes=6, local_path=inbound)],
+                host_cwd=cwd,
+                agent_cwd=Path("/work"),
+            )
+            self.assertIn("`/work/.kanban-attachments/123456-spec.png`", block)
+
+    def test_backlog_parking_ignores_cards_in_backlog(self):
+        import os
+        from unittest import mock
+
+        os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+        import bridge
+
+        t = Task(id="7", title="Draft", project_id="b1")
+        fake_backlog = mock.Mock(current_bucket=mock.Mock(return_value="backlog"))
+        with mock.patch.object(bridge, "BOARD", fake_backlog, create=True):
+            self.assertTrue(bridge.is_parked_in_backlog(t))
+            self.assertFalse(bridge.needs_work(t))
+        fake_todo = mock.Mock(current_bucket=mock.Mock(return_value="to-do"))
+        with mock.patch.object(bridge, "BOARD", fake_todo, create=True):
+            self.assertFalse(bridge.is_parked_in_backlog(t))
+
+    def test_claude_subagent_audit_extraction_separates_parent_and_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            events = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "id": "tu_parent", "name": "Read", "input": {"file_path": "/work/a.py"}},
+                            {
+                                "type": "tool_use",
+                                "id": "tu_sub",
+                                "name": "Agent",
+                                "input": {
+                                    "description": "Audit deps",
+                                    "subagent_type": "Explore",
+                                    "prompt": "Check Cargo.toml for risky deps",
+                                },
+                            },
+                        ]
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "parent_tool_use_id": "tu_sub",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "id": "tu_child_1", "name": "Bash", "input": {"command": "cargo tree"}},
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "parent_tool_use_id": "tu_sub",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "tu_child_1", "is_error": True},
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tu_sub",
+                                "content": [{"type": "text", "text": "No risky deps found."}],
+                            }
+                        ]
+                    },
+                },
+            ]
+            (log_dir / "sess-sub.jsonl").write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+
+            agent = ClaudeAgent(claude_bin=sys.executable, mode="host", base_env={}, state_root=log_dir / "state")
+            parent_calls = agent.extract_tool_calls("sess-sub", log_dir)
+            self.assertEqual(len(parent_calls), 2)
+            self.assertFalse(any("cargo tree" in c for c in parent_calls))
+
+            subs = agent.extract_subagent_audits("sess-sub", log_dir)
+            self.assertEqual(len(subs), 1)
+            self.assertEqual(subs[0].name, "Audit deps (Explore)")
+            self.assertEqual(subs[0].prompt, "Check Cargo.toml for risky deps")
+            self.assertEqual(len(subs[0].tool_calls), 1)
+            self.assertIn("- Bash [ERROR/DENIED]:", subs[0].tool_calls[0])
+            self.assertEqual(subs[0].final_report, "No risky deps found.")
+
+    def test_agy_subagent_audit_extraction_reads_child_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child_log = root / "child-transcript.jsonl"
+            child_steps = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls -la"}}],
+                },
+                {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "ok"},
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [
+                        {"name": "send_message", "args": {"Message": '"Only .git exists."', "Recipient": '"parent"'}}
+                    ],
+                },
+            ]
+            child_log.write_text("\n".join(json.dumps(s) for s in child_steps), encoding="utf-8")
+
+            parent_events = [
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "parent-1",
+                        "step_index": 2,
+                        "state": "DONE",
+                        "step_type": "subagent",
+                        "tool_name": "invoke_subagent",
+                        "subagent_info": {
+                            "subagents": [
+                                {
+                                    "type_name": "research",
+                                    "role": "Smoke Test Researcher",
+                                    "initial_prompt": "Inspect scratch dir",
+                                    "conversation_id": "child-1",
+                                    "log_uri": f"file://{child_log}",
+                                }
+                            ]
+                        },
+                    },
+                }
+            ]
+            (root / "parent-1.jsonl").write_text("\n".join(json.dumps(e) for e in parent_events), encoding="utf-8")
+
+            agent = AgyAgent(agy_bin=sys.executable, base_env={})
+            subs = agent.extract_subagent_audits("parent-1", root)
+            self.assertEqual(len(subs), 1)
+            self.assertEqual(subs[0].name, "Smoke Test Researcher")
+            self.assertEqual(subs[0].prompt, "Inspect scratch dir")
+            self.assertEqual(len(subs[0].tool_calls), 2)
+            self.assertIn("- run_command:", subs[0].tool_calls[0])
+            self.assertEqual(subs[0].final_report, "Only .git exists.")
+
+    def test_claude_model_detection_and_reported_cost_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            events = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "m1",
+                        "model": "claude-sonnet-4-6",
+                        "content": [{"type": "text", "text": "Working"}],
+                        "usage": {"input_tokens": 1000, "output_tokens": 200},
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "parent_tool_use_id": "tu_sub",
+                    "message": {
+                        "id": "m2",
+                        "model": "claude-haiku-4-5-20251001",
+                        "content": [{"type": "text", "text": "Subagent"}],
+                        "usage": {"input_tokens": 500, "output_tokens": 100},
+                    },
+                },
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "Done.\nSTATUS: DONE",
+                    "total_cost_usd": 0.0425,
+                    "modelUsage": {
+                        "claude-sonnet-4-6": {
+                            "inputTokens": 1000,
+                            "outputTokens": 200,
+                            "cacheReadInputTokens": 4000,
+                            "costUSD": 0.04,
+                        },
+                        "claude-haiku-4-5-20251001": {
+                            "inputTokens": 500,
+                            "outputTokens": 100,
+                            "costUSD": 0.0025,
+                        },
+                    },
+                },
+            ]
+            fake_cmd = [sys.executable, "-c", "print(" + repr("\n".join(json.dumps(e) for e in events)) + ")"]
+            agent = ClaudeAgent(claude_bin=sys.executable, mode="host", base_env={}, state_root=log_dir / "state")
+            res = agent._run_streaming(
+                cmd=fake_cmd,
+                cwd=log_dir,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_path=log_dir / "s-cost.jsonl",
+                session_id="s-cost",
+            )
+            # Parent model is sonnet (not overridden by subagent haiku)
+            self.assertEqual(res.model, "claude-sonnet-4-6")
+
+            summary = agent.extract_usage_summary("s-cost", log_dir)
+            self.assertAlmostEqual(summary.reported_cost_usd or 0.0, 0.0425, places=6)
+            md = format_usage_summary(summary)
+            self.assertIn("💰 **Estimated Cost:** **$0.0425**", md)
+            self.assertIn("`claude-sonnet-4-6`", md)
+            self.assertIn("reported by Claude Code", md)
+
+    def test_agy_model_detection_and_usage_cost_estimation_with_subagents(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent_transcript = root / "parent-transcript.jsonl"
+            parent_transcript.write_text(
+                "\n".join(
+                    json.dumps(x)
+                    for x in [
+                        {
+                            "type": "PLANNER_RESPONSE",
+                            "model": "gemini-4-hydrogen-medium",
+                            "input_tokens": 10000,
+                            "cache_read_tokens": 20000,
+                            "output_tokens": 1000,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            child_transcript = root / "child-transcript.jsonl"
+            child_transcript.write_text(
+                "\n".join(
+                    json.dumps(x)
+                    for x in [
+                        {
+                            "type": "PLANNER_RESPONSE",
+                            "model": "gemini-3.5-flash-lite",
+                            "input_tokens": 5000,
+                            "cache_read_tokens": 0,
+                            "output_tokens": 500,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            parent_log = root / "agy-s1.jsonl"
+            parent_log.write_text(
+                json.dumps(
+                    {
+                        "event": "step_update",
+                        "step_update": {
+                            "step_type": "subagent",
+                            "step_index": 2,
+                            "state": "DONE",
+                            "subagent_info": {
+                                "subagents": [
+                                    {"role": "Researcher", "conversation_id": "c1", "log_uri": f"file://{child_transcript}"}
+                                ]
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            agent = AgyAgent(
+                agy_bin=sys.executable,
+                base_env={
+                    "BRIDGE_STATE_ROOT": str(root),
+                    "BRIDGE_PRICING_URL": "",
+                    "BRIDGE_MODEL_PRICING": json.dumps(
+                        {
+                            "gemini-4-hydrogen": [1.50, 7.50, 0.075, 0.0],
+                            "gemini-3.5-flash-lite": [0.30, 2.50, 0.03, 0.0],
+                        }
+                    ),
+                },
+            )
+            with mock.patch.object(AgyAgent, "_transcript_path", return_value=parent_transcript):
+                self.assertEqual(agent._detect_model("agy-s1"), "gemini-4-hydrogen-medium")
+                summary = agent.extract_usage_summary("agy-s1", root)
+
+            self.assertEqual([u.model for u in summary.models], ["gemini-4-hydrogen-medium"])
+            self.assertEqual([u.model for u in summary.subagent_models], ["gemini-3.5-flash-lite"])
+            self.assertIsNotNone(summary.estimated_cost_usd)
+            assert summary.estimated_cost_usd is not None
+            # 10k*1.5/1M + 20k*0.075/1M + 1k*7.5/1M + 5k*0.3/1M + 500*2.5/1M = 0.015 + 0.0015 + 0.0075 + 0.0015 + 0.00125 = 0.02675
+            self.assertAlmostEqual(summary.estimated_cost_usd, 0.02675, places=6)
+            md = format_usage_summary(summary, env=agent.base_env)
+            self.assertIn("💰 **Estimated Cost:** **~$0.0268**", md)
+            self.assertIn("`gemini-4-hydrogen-medium`", md)
+            self.assertIn("subagent `gemini-3.5-flash-lite`", md)
+
+    def test_openrouter_pricing_6hr_cache_and_slug_matching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp)
+            env = {"BRIDGE_STATE_ROOT": str(state_root)}
+            fetch_count = 0
+            sample_payload = {
+                "data": [
+                    {
+                        "id": "google/gemini-4-hydrogen",
+                        "pricing": {"prompt": "0.0000015", "completion": "0.0000075", "input_cache_read": "0.000000075"},
+                    },
+                    {
+                        "id": "anthropic/claude-sonnet-4.6:batch",
+                        "pricing": {"prompt": "0.0000015", "completion": "0.0000075"},
+                    },
+                    {
+                        "id": "anthropic/claude-sonnet-4.6",
+                        "pricing": {"prompt": "0.000003", "completion": "0.000015", "input_cache_read": "0.0000003"},
+                    },
+                    {
+                        "id": "anthropic/claude-haiku-4.5",
+                        "pricing": {"prompt": "0.000001", "completion": "0.000005", "input_cache_read": "0.0000001"},
+                    },
+                ]
+            }
+
+            def fake_fetch(url: str) -> dict:
+                nonlocal fetch_count
+                fetch_count += 1
+                return sample_payload
+
+            # First call fetches & writes disk cache
+            c1 = estimate_model_cost_usd(
+                ModelUsage(model="gemini-4-hydrogen-medium", input_tokens=1_000_000, output_tokens=1_000_000),
+                env=env,
+                now=1000.0,
+                fetcher=fake_fetch,
+            )
+            self.assertAlmostEqual(c1 or 0.0, 9.0, places=6)
+            self.assertEqual(fetch_count, 1)
+
+            # Second call within 6 hours hits disk cache (no refetch) and matches dot/hyphen & date suffix
+            c2 = estimate_model_cost_usd(
+                ModelUsage(model="claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=0),
+                env=env,
+                now=1000.0 + 3600.0,
+                fetcher=fake_fetch,
+            )
+            self.assertAlmostEqual(c2 or 0.0, 3.0, places=6)  # NOT 1.5 (:batch ignored!)
+            self.assertEqual(fetch_count, 1)
+
+            c3 = estimate_model_cost_usd(
+                ModelUsage(model="claude-haiku-4-5-20251001", input_tokens=1_000_000, output_tokens=0),
+                env=env,
+                now=1000.0 + 3600.0,
+                fetcher=fake_fetch,
+            )
+            self.assertAlmostEqual(c3 or 0.0, 1.0, places=6)
+            self.assertEqual(fetch_count, 1)
+
+            # After 6 hours (21600s), cache expires and refetches
+            c4 = estimate_model_cost_usd(
+                ModelUsage(model="claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=0),
+                env=env,
+                now=1000.0 + 6 * 3600 + 5,
+                fetcher=fake_fetch,
+            )
+            self.assertAlmostEqual(c4 or 0.0, 3.0, places=6)
+            self.assertEqual(fetch_count, 2)
+
+            # If refetch fails later, stale cache is still used gracefully
+            def fail_fetch(url: str) -> dict:
+                raise RuntimeError("offline")
+
+            c5 = estimate_model_cost_usd(
+                ModelUsage(model="claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=0),
+                env=env,
+                now=1000.0 + 20 * 3600,
+                fetcher=fail_fetch,
+            )
+            self.assertAlmostEqual(c5 or 0.0, 3.0, places=6)
+
+    def test_agy_swarm_worker_cost_rollup_from_transcript(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coord_t = root / "coord.jsonl"
+            worker_t = root / "worker.jsonl"
+            worker_t.write_text(
+                json.dumps(
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "model": "gemini-4-hydrogen-medium",
+                        "input_tokens": 20000,
+                        "cache_read_tokens": 40000,
+                        "output_tokens": 2000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            coord_t.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "model": "gemini-4-neon-high",
+                                "input_tokens": 10000,
+                                "cache_read_tokens": 0,
+                                "output_tokens": 500,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "GENERIC",
+                                "content": 'Created At: ...\n{"status":"added","name":"dev","model":"gemini-4-hydrogen-medium","conversation_id":"worker-cid-1"}',
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_tpath(cid):
+                return {"coord-cid": coord_t, "worker-cid-1": worker_t}.get(cid)
+
+            agent = AgyAgent(
+                agy_bin=sys.executable,
+                base_env={
+                    "BRIDGE_STATE_ROOT": str(root),
+                    "BRIDGE_PRICING_URL": "",
+                    "BRIDGE_MODEL_PRICING": json.dumps(
+                        {
+                            "gemini-4-neon": [3.0, 15.0, 0.15, 0.0],
+                            "gemini-4-hydrogen": [1.5, 7.5, 0.075, 0.0],
+                        }
+                    ),
+                },
+            )
+            with mock.patch.object(AgyAgent, "_transcript_path", side_effect=fake_tpath):
+                summary = agent.extract_usage_summary("coord-cid", root)
+
+            self.assertEqual([u.model for u in summary.models], ["gemini-4-neon-high"])
+            self.assertEqual([u.model for u in summary.subagent_models], ["gemini-4-hydrogen-medium"])
+            self.assertEqual(summary.subagent_models[0].input_tokens, 20000)
+            self.assertEqual(summary.subagent_models[0].cache_read_tokens, 40000)
+            self.assertIsNotNone(summary.estimated_cost_usd)
+            # coord: 10k*3/1M + 500*15/1M = 0.0375; worker: 20k*1.5/1M + 40k*0.075/1M + 2k*7.5/1M = 0.048 => 0.0855
+            self.assertAlmostEqual(summary.estimated_cost_usd or 0.0, 0.0855, places=6)
 
 
 if __name__ == "__main__":

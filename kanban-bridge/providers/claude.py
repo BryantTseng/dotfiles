@@ -36,7 +36,11 @@ from typing import Callable
 from providers import (
     AgentProvider,
     AgentResult,
+    ModelUsage,
+    SubagentAudit,
     Task,
+    UsageSummary,
+    estimate_model_cost_usd,
     register_proxy_token,
     unregister_proxy_token,
 )
@@ -266,6 +270,7 @@ class ClaudeAgent(AgentProvider):
             steps = 0
             last_step: str | None = None
             result_ev: dict | None = None
+            detected_model: str | None = self.model
             subagent_by_id: dict[str, str] = {}  # tool_use_id -> item label
             subtask_state: dict[str, bool] = {}  # item_text -> is_completed
             stop_ticker = threading.Event()
@@ -298,7 +303,10 @@ class ClaudeAgent(AgentProvider):
                         continue
                     ev_type = ev.get("type")
                     if ev_type == "assistant":
-                        for item in (ev.get("message") or {}).get("content") or []:
+                        msg = ev.get("message") or {}
+                        if not ev.get("parent_tool_use_id") and msg.get("model"):
+                            detected_model = str(msg["model"]).strip()
+                        for item in msg.get("content") or []:
                             if item.get("type") == "tool_use":
                                 steps += 1
                                 last_step = _describe_tool(item)
@@ -345,7 +353,13 @@ class ClaudeAgent(AgentProvider):
                     text=f"⚠️ Claude failed (exit {p.returncode}):\n\n```\n{stderr_tail}\n```",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
+
+            if not detected_model and isinstance(result_ev.get("modelUsage"), dict):
+                mu_keys = [str(k).strip() for k in result_ev["modelUsage"].keys() if k]
+                if mu_keys:
+                    detected_model = mu_keys[0]
 
             text = (result_ev.get("result") or "").strip()
             subtype = result_ev.get("subtype", "success")
@@ -355,14 +369,21 @@ class ClaudeAgent(AgentProvider):
                     text=f"⚠️ Claude stopped early ({subtype}).\n\n{text}".strip(),
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
             if is_err:
                 return AgentResult(
                     text=f"⚠️ Claude ended with an error:\n\n{text}",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
-            return AgentResult(text=text or "(no output)", session_id=session_id, is_error=False)
+            return AgentResult(
+                text=text or "(no output)",
+                session_id=session_id,
+                is_error=False,
+                model=detected_model,
+            )
 
     def _build_docker_cmd(
         self,
@@ -568,7 +589,13 @@ class ClaudeAgent(AgentProvider):
         )
         return res.text
 
-    def extract_tool_calls(self, session_id: str, log_dir: Path) -> list[str]:
+    def agent_workdir(self, cwd: Path) -> Path:
+        if self.mode == "docker":
+            workdir, _ = _worktree_git_mount(cwd)
+            return Path(workdir)
+        return cwd
+
+    def _transcript_files(self, session_id: str, log_dir: Path, task_id: str | None = None) -> list[Path]:
         files: list[Path] = []
         primary = log_dir / f"{session_id}.jsonl"
         if primary.exists():
@@ -576,6 +603,28 @@ class ClaudeAgent(AgentProvider):
         host_projects = Path("~/.claude/projects").expanduser()
         if host_projects.is_dir():
             files.extend(host_projects.glob(f"*/{session_id}.jsonl"))
+        if task_id and self.state_root.is_dir():
+            task_proj = self.state_root / f"task-{task_id}" / "projects"
+            if task_proj.is_dir():
+                files.extend(task_proj.glob(f"*/{session_id}.jsonl"))
+        return files
+
+    @staticmethod
+    def _extract_result_text(raw_content) -> str:
+        if isinstance(raw_content, str):
+            return raw_content.strip()
+        if isinstance(raw_content, list):
+            parts: list[str] = []
+            for blk in raw_content:
+                if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text"):
+                    parts.append(str(blk["text"]))
+                elif isinstance(blk, str):
+                    parts.append(blk)
+            return "\n".join(parts).strip()
+        return ""
+
+    def extract_tool_calls(self, session_id: str, log_dir: Path) -> list[str]:
+        files = self._transcript_files(session_id, log_dir)
         if not files:
             return ["(session transcript not found)"]
 
@@ -586,6 +635,9 @@ class ClaudeAgent(AgentProvider):
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                # Tool calls executed inside a child subagent belong under that subagent, not parent.
+                if entry.get("parent_tool_use_id"):
                     continue
                 content = (entry.get("message") or {}).get("content")
                 if not isinstance(content, list):
@@ -615,6 +667,243 @@ class ClaudeAgent(AgentProvider):
             f"- {unique[cid][0]}{' [ERROR/DENIED]' if cid in errors else ''}: {unique[cid][1]}"
             for cid in order
         ]
+
+    def extract_subagent_audits(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> list[SubagentAudit]:
+        files = self._transcript_files(session_id, log_dir, task_id=task_id)
+        if not files:
+            return []
+
+        order: list[str] = []
+        meta: dict[str, tuple[str, str]] = {}  # tool_use_id -> (name, prompt)
+        reports: dict[str, str] = {}
+        child_calls: dict[str, list[tuple[str, str, str]]] = {}
+        child_errors: dict[str, set[str]] = {}
+
+        for f in files:
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = (entry.get("message") or {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                parent_tid = str(entry.get("parent_tool_use_id") or "")
+                if parent_tid:
+                    for item in content:
+                        if item.get("type") == "tool_use":
+                            child_calls.setdefault(parent_tid, []).append(
+                                (
+                                    str(item.get("id") or ""),
+                                    str(item.get("name") or "?"),
+                                    json.dumps(item.get("input") or {}, ensure_ascii=False)[:800],
+                                )
+                            )
+                        elif item.get("type") == "tool_result" and item.get("is_error"):
+                            child_errors.setdefault(parent_tid, set()).add(str(item.get("tool_use_id") or ""))
+                else:
+                    for item in content:
+                        if item.get("type") == "tool_use" and item.get("name") in ("Agent", "Task"):
+                            tid = str(item.get("id") or "")
+                            if not tid:
+                                continue
+                            inp = item.get("input") or {}
+                            desc = str(inp.get("description") or inp.get("subagent_type") or "subagent").strip()
+                            stype = str(inp.get("subagent_type") or "").strip()
+                            label = desc + (f" ({stype})" if stype and stype.lower() not in desc.lower() else "")
+                            prompt = str(inp.get("prompt") or desc).strip()[:2000]
+                            if tid not in meta:
+                                order.append(tid)
+                            meta[tid] = (label[:160], prompt)
+                        elif item.get("type") == "tool_result":
+                            tid = str(item.get("tool_use_id") or "")
+                            if tid in meta:
+                                txt = self._extract_result_text(item.get("content"))
+                                if txt:
+                                    reports[tid] = txt[:2500]
+
+        # Also check on-disk Claude subagent JSONL files (Docker state_root or host ~/.claude)
+        # when child tool calls weren't streamed with parent_tool_use_id.
+        sub_dirs: list[Path] = []
+        for base in [Path("~/.claude/projects").expanduser(), *(
+            [self.state_root / f"task-{task_id}" / "projects"] if task_id else []
+        )]:
+            if base.is_dir():
+                sub_dirs.extend(base.glob(f"*/{session_id}/subagents"))
+                sub_dirs.extend(base.glob("*/subagents"))
+        seen_subfiles: set[Path] = set()
+        for sdir in sub_dirs:
+            for sf in sorted(sdir.glob("agent-*.jsonl")):
+                rpath = sf.resolve()
+                if rpath in seen_subfiles:
+                    continue
+                seen_subfiles.add(rpath)
+                sid_key = f"file:{sf.stem}"
+                s_calls: list[tuple[str, str, str]] = []
+                s_errs: set[str] = set()
+                s_prompt = ""
+                s_report = ""
+                for line in sf.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = entry.get("message") or {}
+                    role = msg.get("role") or entry.get("type")
+                    content = msg.get("content")
+                    if role == "user" and not s_prompt:
+                        s_prompt = self._extract_result_text(content)[:2000]
+                    if isinstance(content, list):
+                        for item in content:
+                            if item.get("type") == "tool_use":
+                                s_calls.append(
+                                    (
+                                        str(item.get("id") or ""),
+                                        str(item.get("name") or "?"),
+                                        json.dumps(item.get("input") or {}, ensure_ascii=False)[:800],
+                                    )
+                                )
+                            elif item.get("type") == "tool_result" and item.get("is_error"):
+                                s_errs.add(str(item.get("tool_use_id") or ""))
+                            elif role == "assistant" and item.get("type") == "text" and item.get("text"):
+                                s_report = str(item["text"]).strip()[:2500]
+                    elif role == "assistant" and isinstance(content, str) and content.strip():
+                        s_report = content.strip()[:2500]
+
+                # Match to an existing parent Agent/Task call without child_calls if prompts align
+                matched_tid = None
+                for tid in order:
+                    if not child_calls.get(tid) and s_prompt and meta[tid][1] and (
+                        s_prompt[:120] in meta[tid][1] or meta[tid][1][:120] in s_prompt
+                    ):
+                        matched_tid = tid
+                        break
+                if matched_tid:
+                    child_calls[matched_tid] = s_calls
+                    child_errors[matched_tid] = s_errs
+                    if s_report and not reports.get(matched_tid):
+                        reports[matched_tid] = s_report
+                elif s_calls or s_report:
+                    order.append(sid_key)
+                    meta[sid_key] = (sf.stem, s_prompt)
+                    child_calls[sid_key] = s_calls
+                    child_errors[sid_key] = s_errs
+                    if s_report:
+                        reports[sid_key] = s_report
+
+        audits: list[SubagentAudit] = []
+        for tid in order:
+            name, prompt = meta[tid]
+            errs = child_errors.get(tid, set())
+            unique_c: dict[str, tuple[str, str]] = {}
+            c_order: list[str] = []
+            for cid, cname, cinp in child_calls.get(tid, []):
+                if cid not in unique_c:
+                    c_order.append(cid)
+                unique_c[cid] = (cname, cinp)
+            formatted_calls = [
+                f"- {unique_c[cid][0]}{' [ERROR/DENIED]' if cid in errs else ''}: {unique_c[cid][1]}"
+                for cid in c_order
+            ]
+            audits.append(
+                SubagentAudit(
+                    id=tid,
+                    name=name,
+                    prompt=prompt,
+                    tool_calls=formatted_calls,
+                    final_report=reports.get(tid, ""),
+                )
+            )
+        return audits
+
+    def extract_usage_summary(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> UsageSummary:
+        primary = log_dir / f"{session_id}.jsonl"
+        files = [primary] if primary.exists() else self._transcript_files(session_id, log_dir, task_id=task_id)
+        if not files:
+            return UsageSummary()
+
+        reported_total = 0.0
+        has_reported = False
+        result_by_model: dict[str, ModelUsage] = {}
+        # Keep the LAST assistant event per message.id so streaming updates don't undercount output_tokens.
+        latest_by_msg_id: dict[str, tuple[bool, str, dict]] = {}
+        anon_msgs: list[tuple[bool, str, dict]] = []
+
+        for f in files:
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ev_type = ev.get("type")
+                if ev_type == "result":
+                    if ev.get("total_cost_usd") is not None:
+                        reported_total += float(ev["total_cost_usd"])
+                        has_reported = True
+                    mu = ev.get("modelUsage")
+                    if isinstance(mu, dict):
+                        for mname, info in mu.items():
+                            if not isinstance(info, dict):
+                                continue
+                            m = str(mname).strip() or "claude"
+                            u = result_by_model.setdefault(m, ModelUsage(model=m))
+                            u.input_tokens += int(info.get("inputTokens") or 0)
+                            u.output_tokens += int(info.get("outputTokens") or 0)
+                            u.cache_read_tokens += int(info.get("cacheReadInputTokens") or 0)
+                            u.cache_write_tokens += int(info.get("cacheCreationInputTokens") or 0)
+                            if info.get("costUSD") is not None:
+                                u.reported_cost_usd = (u.reported_cost_usd or 0.0) + float(info["costUSD"])
+                elif ev_type == "assistant":
+                    msg = ev.get("message") or {}
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    is_sub = bool(ev.get("parent_tool_use_id"))
+                    m = str(msg.get("model") or self.model or "claude").strip() or "claude"
+                    mid = str(msg.get("id") or "")
+                    if mid:
+                        latest_by_msg_id[mid] = (is_sub, m, usage)
+                    else:
+                        anon_msgs.append((is_sub, m, usage))
+
+        parent_by_model: dict[str, ModelUsage] = {}
+        sub_by_model: dict[str, ModelUsage] = {}
+        for is_sub, m, usage in list(latest_by_msg_id.values()) + anon_msgs:
+            bucket = sub_by_model if is_sub else parent_by_model
+            u = bucket.setdefault(m, ModelUsage(model=m))
+            u.input_tokens += int(usage.get("input_tokens") or 0)
+            u.output_tokens += int(usage.get("output_tokens") or 0)
+            u.cache_read_tokens += int(usage.get("cache_read_input_tokens") or 0)
+            u.cache_write_tokens += int(usage.get("cache_creation_input_tokens") or 0)
+
+        if result_by_model:
+            models = list(result_by_model.values())
+            sub_models: list[ModelUsage] = []
+        else:
+            models = list(parent_by_model.values())
+            sub_models = list(sub_by_model.values())
+
+        if has_reported:
+            return UsageSummary(
+                models=models,
+                subagent_models=sub_models,
+                reported_cost_usd=reported_total,
+                cost_note="(reported by Claude Code)",
+            )
+
+        est_parts = [estimate_model_cost_usd(u, env=self.base_env) for u in models + sub_models]
+        known = [c for c in est_parts if c is not None]
+        est_total = sum(known) if known else None
+        return UsageSummary(
+            models=models,
+            subagent_models=sub_models,
+            estimated_cost_usd=est_total,
+            cost_note="(estimated via OpenRouter pricing)" if est_total is not None else "",
+        )
 
     def force_cleanup(self) -> None:
         if self.mode != "docker":

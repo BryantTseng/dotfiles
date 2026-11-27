@@ -28,7 +28,15 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from providers import AgentProvider, AgentResult, Task
+from providers import (
+    AgentProvider,
+    AgentResult,
+    ModelUsage,
+    SubagentAudit,
+    Task,
+    UsageSummary,
+    estimate_model_cost_usd,
+)
 
 log = logging.getLogger("bridge.agy")
 
@@ -376,6 +384,8 @@ class AgyAgent(AgentProvider):
             if timed_out.is_set():
                 raise subprocess.TimeoutExpired(cmd, timeout)
 
+            detected_model = self._detect_model(session_id) or self.model
+
             if result_payload is None:
                 err.seek(0)
                 stderr_tail = err.read()[-2000:].strip()
@@ -383,6 +393,7 @@ class AgyAgent(AgentProvider):
                     text=f"⚠️ Agy failed (exit {p.returncode}):\n\n```\n{stderr_tail}\n```",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
 
             status = str(result_payload.get("status") or "SUCCESS").upper()
@@ -405,6 +416,7 @@ class AgyAgent(AgentProvider):
                     text=f"⚠️ Agy ended with status `{status}`:\n\n{detail}",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
             if denied and not text:
                 names = ", ".join(d.get("display_name") or d.get("action") or "?" for d in denied)
@@ -412,8 +424,14 @@ class AgyAgent(AgentProvider):
                     text=f"⚠️ Agy could not proceed because headless permissions denied: {names}.",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
-            return AgentResult(text=text or "(no output)", session_id=session_id, is_error=False)
+            return AgentResult(
+                text=text or "(no output)",
+                session_id=session_id,
+                is_error=False,
+                model=detected_model,
+            )
 
     def run_task(
         self,
@@ -559,3 +577,304 @@ class AgyAgent(AgentProvider):
             f"- {calls[k][0]}{' [ERROR/DENIED]' if calls[k][2] else ''}: {calls[k][1]}"
             for k in order
         ]
+
+    def extract_subagent_audits(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> list[SubagentAudit]:
+        log_file = log_dir / f"{session_id}.jsonl"
+        if not log_file.exists():
+            return []
+
+        order: list[str] = []
+        subs: dict[str, dict] = {}
+        for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("event") != "step_update":
+                continue
+            su = ev.get("step_update") or {}
+            if str(su.get("step_type") or "").lower() != "subagent":
+                continue
+            sidx = int(su.get("step_index") or 0)
+            for idx, sub in enumerate((su.get("subagent_info") or {}).get("subagents") or []):
+                cid = str(sub.get("conversation_id") or "")
+                role = str(sub.get("role") or sub.get("type_name") or "subagent").strip()
+                ttype = str(sub.get("type_name") or "").strip()
+                key = cid or f"step:{sidx}:{idx}:{role}"
+                # Upgrade placeholder step key once DONE provides conversation_id
+                step_key = f"step:{sidx}:{idx}:{role}"
+                if cid and step_key in subs and cid not in subs:
+                    subs[cid] = subs.pop(step_key)
+                    order = [cid if k == step_key else k for k in order]
+                if key not in subs:
+                    order.append(key)
+                    subs[key] = {}
+                entry = subs[key]
+                entry["id"] = cid or key
+                entry["role"] = role
+                entry["type_name"] = ttype
+                if sub.get("initial_prompt"):
+                    entry["prompt"] = str(sub["initial_prompt"]).strip()[:2000]
+                if sub.get("log_uri"):
+                    entry["log_uri"] = str(sub["log_uri"])
+
+        audits: list[SubagentAudit] = []
+        for key in order:
+            info = subs[key]
+            role = info.get("role") or "subagent"
+            ttype = info.get("type_name") or ""
+            label = role + (f" ({ttype})" if ttype and ttype.lower() not in role.lower() else "")
+            prompt = info.get("prompt") or ""
+
+            log_uri = info.get("log_uri") or ""
+            transcript_path: Path | None = None
+            if log_uri.startswith("file://"):
+                cand = Path(log_uri[len("file://") :])
+                if cand.is_file():
+                    transcript_path = cand
+            if transcript_path is None and info.get("id") and not str(info["id"]).startswith("step:"):
+                cand = (
+                    Path.home()
+                    / ".gemini"
+                    / "antigravity-cli"
+                    / "brain"
+                    / str(info["id"])
+                    / ".system_generated"
+                    / "logs"
+                    / "transcript.jsonl"
+                )
+                if cand.is_file():
+                    transcript_path = cand
+
+            tool_calls: list[str] = []
+            final_report = ""
+            if transcript_path is not None:
+                steps_raw: list[dict] = []
+                for tline in transcript_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        steps_raw.append(json.loads(tline))
+                    except json.JSONDecodeError:
+                        continue
+                for i, st in enumerate(steps_raw):
+                    if st.get("type") != "PLANNER_RESPONSE":
+                        continue
+                    next_err = (
+                        i + 1 < len(steps_raw)
+                        and str(steps_raw[i + 1].get("status") or "").upper() in ("ERROR", "FAILED", "DENIED")
+                    )
+                    for tc in st.get("tool_calls") or []:
+                        tc_name = str(tc.get("name") or "?")
+                        tc_args = tc.get("args") or {}
+                        args_s = json.dumps(tc_args, ensure_ascii=False)[:800]
+                        tool_calls.append(f"- {tc_name}{' [ERROR/DENIED]' if next_err else ''}: {args_s}")
+                        if tc_name == "send_message" and tc_args.get("Message"):
+                            msg = str(tc_args["Message"]).strip()
+                            if len(msg) >= 2 and msg[0] == '"' and msg[-1] == '"':
+                                try:
+                                    msg = json.loads(msg)
+                                except Exception:
+                                    pass
+                            final_report = str(msg).strip()[:2500]
+                    if st.get("content") and not final_report:
+                        final_report = str(st["content"]).strip()[:2500]
+
+            audits.append(
+                SubagentAudit(
+                    id=str(info.get("id") or key),
+                    name=label[:160],
+                    prompt=prompt,
+                    tool_calls=tool_calls,
+                    final_report=final_report,
+                )
+            )
+        return audits
+
+    @staticmethod
+    def _transcript_path(session_id: str | None) -> Path | None:
+        if not session_id:
+            return None
+        cand = (
+            Path.home()
+            / ".gemini"
+            / "antigravity-cli"
+            / "brain"
+            / session_id
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
+        return cand if cand.is_file() else None
+
+    def _detect_model(self, session_id: str | None) -> str | None:
+        tpath = self._transcript_path(session_id)
+        if tpath is None:
+            return None
+        last_model: str | None = None
+        for line in tpath.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                st = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if st.get("type") == "PLANNER_RESPONSE" and st.get("model"):
+                last_model = str(st["model"]).strip()
+        return last_model
+
+    @staticmethod
+    def _usage_from_transcript(tpath: Path) -> dict[str, ModelUsage]:
+        by_model: dict[str, ModelUsage] = {}
+        for line in tpath.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                st = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if st.get("type") != "PLANNER_RESPONSE":
+                continue
+            m = str(st.get("model") or "agy").strip() or "agy"
+            u = by_model.setdefault(m, ModelUsage(model=m))
+            u.input_tokens += int(st.get("input_tokens") or 0)
+            u.output_tokens += int(st.get("output_tokens") or 0)
+            u.cache_read_tokens += int(st.get("cache_read_tokens") or 0)
+        return by_model
+
+    @classmethod
+    def _discover_child_agents_in_transcript(cls, tpath: Path) -> list[tuple[str, str, Path]]:
+        """Discover spawned subagents and swarm workers referenced inside a `transcript.jsonl`.
+
+        Returns `[(conversation_id, display_name, transcript_path), ...]`.
+        """
+        found: list[tuple[str, str, Path]] = []
+        text = tpath.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            if "logAbsoluteUri" in line:
+                for uri_m in re.finditer(r'file://([^"\\\s]+transcript\.jsonl)', line):
+                    cand = Path(uri_m.group(1))
+                    if cand.is_file():
+                        # Try to pull conversation_id from brain/<cid>/.system_generated/...
+                        cid = cand.parents[2].name if len(cand.parents) >= 3 else cand.stem
+                        found.append((cid, f"subagent {cid[:8]}", cand))
+            if '"status":"added"' in line or '\\"status\\":\\"added\\"' in line:
+                try:
+                    st = json.loads(line)
+                    content = str(st.get("content") or "")
+                except json.JSONDecodeError:
+                    content = line
+                for chunk in content.splitlines():
+                    chunk = chunk.strip()
+                    if not chunk.startswith("{"):
+                        continue
+                    try:
+                        obj = json.loads(chunk)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("status") != "added":
+                        continue
+                    workers = obj.get("workers") if isinstance(obj.get("workers"), list) else [obj]
+                    for w in workers:
+                        if not isinstance(w, dict):
+                            continue
+                        cid = str(w.get("conversation_id") or "").strip()
+                        if not cid:
+                            continue
+                        cand = cls._transcript_path(cid)
+                        if cand is not None:
+                            wname = str(w.get("name") or cid[:8]).strip()
+                            wmodel = str(w.get("model") or "").strip()
+                            label = f"[swarm] {wname}" + (f" ({wmodel})" if wmodel else "")
+                            found.append((cid, label, cand))
+        return found
+
+    def extract_usage_summary(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> UsageSummary:
+        parent_by_model: dict[str, ModelUsage] = {}
+        tpath = self._transcript_path(session_id)
+        if tpath is not None:
+            parent_by_model = self._usage_from_transcript(tpath)
+
+        log_file = log_dir / f"{session_id}.jsonl"
+        sub_paths: list[Path] = []
+        seen_sub_paths: set[Path] = set()
+        if tpath is not None:
+            seen_sub_paths.add(tpath.resolve())
+            for _, _, cand in self._discover_child_agents_in_transcript(tpath):
+                r = cand.resolve()
+                if r not in seen_sub_paths:
+                    seen_sub_paths.add(r)
+                    sub_paths.append(r)
+
+        if log_file.exists():
+            last_result_usage: dict | None = None
+            for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("event") == "result":
+                    usage = (ev.get("result") or ev).get("usage")
+                    if isinstance(usage, dict):
+                        last_result_usage = usage
+                elif ev.get("event") == "step_update":
+                    su = ev.get("step_update") or {}
+                    if str(su.get("step_type") or "").lower() == "subagent":
+                        for sub in (su.get("subagent_info") or {}).get("subagents") or []:
+                            luri = str(sub.get("log_uri") or "")
+                            cand: Path | None = None
+                            if luri.startswith("file://"):
+                                p = Path(luri[len("file://") :])
+                                if p.is_file():
+                                    cand = p
+                            if cand is None and sub.get("conversation_id"):
+                                cand = self._transcript_path(str(sub["conversation_id"]))
+                            if cand is not None:
+                                r = cand.resolve()
+                                if r not in seen_sub_paths:
+                                    seen_sub_paths.add(r)
+                                    sub_paths.append(r)
+                    elif str(su.get("tool_name") or "") == "swarm":
+                        out_text = str((su.get("tool_info") or {}).get("output") or "")
+                        for cid_m in re.finditer(r'"conversation_id"\s*:\s*"([A-Za-z0-9._-]+)"', out_text):
+                            cand = self._transcript_path(cid_m.group(1))
+                            if cand is not None:
+                                r = cand.resolve()
+                                if r not in seen_sub_paths:
+                                    seen_sub_paths.add(r)
+                                    sub_paths.append(r)
+
+            if not parent_by_model and last_result_usage:
+                m = self.model or "agy"
+                parent_by_model[m] = ModelUsage(
+                    model=m,
+                    input_tokens=int(last_result_usage.get("input_tokens") or 0),
+                    output_tokens=int(last_result_usage.get("output_tokens") or 0),
+                    cache_read_tokens=int(last_result_usage.get("cache_read_tokens") or 0),
+                )
+
+        # Recursively discover any nested grandchild subagents or swarm helper workers.
+        sub_by_model: dict[str, ModelUsage] = {}
+        queue_paths = list(sub_paths)
+        while queue_paths:
+            sp = queue_paths.pop(0)
+            for m, u in self._usage_from_transcript(sp).items():
+                dst = sub_by_model.setdefault(m, ModelUsage(model=m))
+                dst.input_tokens += u.input_tokens
+                dst.output_tokens += u.output_tokens
+                dst.cache_read_tokens += u.cache_read_tokens
+            for _, _, cand in self._discover_child_agents_in_transcript(sp):
+                r = cand.resolve()
+                if r not in seen_sub_paths:
+                    seen_sub_paths.add(r)
+                    queue_paths.append(r)
+
+        models = list(parent_by_model.values())
+        sub_models = list(sub_by_model.values())
+        est_parts = [estimate_model_cost_usd(u, env=self.base_env) for u in models + sub_models]
+        known = [c for c in est_parts if c is not None]
+        est_total = sum(known) if known else None
+        return UsageSummary(
+            models=models,
+            subagent_models=sub_models,
+            estimated_cost_usd=est_total,
+            cost_note="(estimated via OpenRouter pricing)" if est_total is not None else "",
+        )

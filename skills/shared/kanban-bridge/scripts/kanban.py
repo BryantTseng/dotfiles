@@ -5,8 +5,8 @@ Reads PLANKA_URL and PLANKA_API_KEY directly from ~/.config/kanban-bridge/env (n
 secrets). Enforces the kanban-bridge safety guardrails in code:
   - Refuses to add/remove `access:*` or `session:*` labels.
   - Refuses to post `approve` / `deny` comments.
-  - Preserves `<!-- agy-session:... -->` footers when editing card descriptions.
-  - Never attaches the trigger label (`agy`) unless `--trigger` / `--confirm-trigger` is passed.
+  - Preserves `<!-- <provider>-session:... -->` footers when editing card descriptions.
+  - Never attaches the trigger label (`BRIDGE_TRIGGER_LABEL`) unless `--trigger` / `--confirm-trigger` is passed.
 """
 
 from __future__ import annotations
@@ -71,9 +71,10 @@ class PlankaClient:
                 if str(b["id"]) == board_arg or (b.get("name") or "").lower() == board_arg.lower():
                     return str(b["id"]), b.get("name") or str(b["id"])
             raise SystemExit(f"Board not found: {board_arg!r}")
-        for b in boards:
-            if (b.get("name") or "").lower() == "agy":
-                return str(b["id"]), b["name"]
+        for preferred in (self.trigger_label.lower(), "agy"):
+            for b in boards:
+                if (b.get("name") or "").lower() == preferred:
+                    return str(b["id"]), b["name"]
         return str(boards[0]["id"]), boards[0].get("name") or str(boards[0]["id"])
 
     def board_bundle(self, board_id: str) -> dict:
@@ -320,7 +321,7 @@ def cmd_edit(cli: PlankaClient, args) -> None:
         m = SESSION_TAG_RE.search(old_desc)
         clean_new = SESSION_TAG_RE.sub("", args.desc).rstrip()
         if m:
-            tag = f"<!-- agy-session:{m.group(1)} -->"
+            tag = m.group(0).strip()
             updates["description"] = f"{clean_new}\n\n{tag}" if clean_new else tag
         else:
             updates["description"] = clean_new
@@ -450,7 +451,7 @@ def cmd_checklist(cli: PlankaClient, args) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Safe CLI for operating the local Planka kanban board.")
-    p.add_argument("--board", help="Board ID or name (defaults to 'Agy')")
+    p.add_argument("--board", help="Board ID or name (defaults to BRIDGE_TRIGGER_LABEL, else 'Agy')")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("health", help="Check Planka API and bridge /health")
@@ -474,7 +475,7 @@ def main() -> None:
     )
     p_create.add_argument("--plan-first", action="store_true", help="Attach plan-first label (spec/Q&A before coding)")
     p_create.add_argument("--direct", action="store_true", help="Attach direct label (start coding immediately)")
-    p_create.add_argument("--trigger", action="store_true", help="Attach 'agy' trigger label to start a run")
+    p_create.add_argument("--trigger", action="store_true", help="Attach the configured trigger label to start a run")
 
     p_move = sub.add_parser("move", help="Move a card to a column by name")
     p_move.add_argument("card_id")
