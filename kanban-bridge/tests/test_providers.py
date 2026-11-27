@@ -26,7 +26,7 @@ from providers import (
 )
 from providers.agy import AgyAgent
 from providers.claude import ClaudeAgent, _worktree_git_mount
-from providers.planka import PlankaBoard, SESSION_TAG_RE, _encode_multipart
+from providers.planka import HEX_TO_PLANKA_COLOR, PlankaBoard, SESSION_TAG_RE, _encode_multipart
 
 
 class TestProviderLoadingAndRegistry(unittest.TestCase):
@@ -707,6 +707,21 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
         board.attach_session_label("c1", "sess-agy", "session:", "grey", provider="agy")
         self.assertEqual(patched_descs[0], "Card body\n\n<!-- claude-session:sess-claude -->")
         self.assertEqual(patched_descs[1], "Card body\n\n<!-- agy-session:sess-agy -->")
+
+    def test_all_mapped_planka_label_colors_are_valid(self):
+        # Exact Label.COLORS allowlist from Planka v2 /app/api/models/Label.js
+        valid_colors = {
+            "muddy-grey", "autumn-leafs", "morning-sky", "antique-blue", "egg-yellow",
+            "desert-sand", "dark-granite", "fresh-salad", "lagoon-blue", "midnight-blue",
+            "light-orange", "pumpkin-orange", "light-concrete", "sunny-grass", "navy-blue",
+            "lilac-eyes", "apricot-red", "orange-peel", "silver-glint", "bright-moss",
+            "deep-ocean", "summer-sky", "berry-red", "light-cocoa", "grey-stone",
+            "tank-green", "coral-green", "sugar-plum", "pink-tulip", "shady-rust",
+            "wet-rock", "wet-moss", "turquoise-sea", "lavender-fields", "piggy-red",
+            "light-mud", "gun-metal", "modern-green", "french-coast", "sweet-lilac",
+        }
+        for hx, color in HEX_TO_PLANKA_COLOR.items():
+            self.assertIn(color, valid_colors, f"invalid Planka v2 color {color!r} for #{hx}")
 
 
 class TestCrossPlatformWorkdirBacklogAndSubagentAudits(unittest.TestCase):
