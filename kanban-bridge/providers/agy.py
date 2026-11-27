@@ -42,6 +42,7 @@ BRIDGE_SECRET_KEYS = {
 }
 
 PROGRESS_EVERY = 30
+SUBTASK_LIST = "Subagents & Tasks"
 
 
 def _describe_tool(tool_name: str, params: dict | None) -> str:
@@ -116,12 +117,20 @@ class AgyAgent(AgentProvider):
         procs: set,
         on_progress: Callable[[int, int, str], None] | None = None,
         on_session_id: Callable[[str], None] | None = None,
+        on_subtask: Callable[[str, str, bool], None] | None = None,
         log_dir: Path | None = None,
         known_session_id: str | None = None,
     ) -> AgentResult:
         buffered_lines: list[str] = []
         session_id = known_session_id
         log_file = None
+
+        def emit_subtask(item_text: str, is_completed: bool) -> None:
+            if on_subtask and item_text:
+                try:
+                    on_subtask(SUBTASK_LIST, item_text, is_completed)
+                except Exception:
+                    log.warning("on_subtask callback failed", exc_info=True)
 
         def open_log(sid: str):
             nonlocal log_file
@@ -165,7 +174,16 @@ class AgyAgent(AgentProvider):
             result_payload: dict | None = None
             step_texts: dict[int, list[str]] = {}
             last_text_step: int | None = None
+            open_subtasks: dict[str, bool] = {}  # item_text -> is_completed
+            swarm_members: dict[str, str] = {}   # roster name -> item_text
+            workflow_steps: dict[int, str] = {}  # step_index -> item_text
             stop_ticker = threading.Event()
+
+            def track_subtask(label: str, done: bool) -> None:
+                if open_subtasks.get(label) == done:
+                    return
+                open_subtasks[label] = done
+                emit_subtask(label, done)
 
             def ticker():
                 while not stop_ticker.wait(PROGRESS_EVERY):
@@ -213,11 +231,54 @@ class AgyAgent(AgentProvider):
                                     on_session_id(cid)
                                 except Exception:
                                     log.exception("on_session_id callback failed")
-                        if su.get("step_type") == "tool" and su.get("state") == "ACTIVE":
-                            steps += 1
+                        if su.get("step_type") == "tool":
                             tinfo = su.get("tool_info") or {}
                             tname = su.get("tool_name") or tinfo.get("name") or "?"
-                            last_step = _describe_tool(tname, tinfo.get("parameters"))
+                            params = tinfo.get("parameters") or {}
+                            tstate = str(su.get("state") or "").upper()
+                            sidx = int(su.get("step_index") or 0)
+                            if tstate == "ACTIVE":
+                                steps += 1
+                                last_step = _describe_tool(tname, params)
+                                if tname == "invoke_subagent":
+                                    role = str(params.get("Role") or params.get("TypeName") or "subagent").strip()
+                                    ttype = str(params.get("TypeName") or "").strip()
+                                    label = f"[subagent] {role}" + (f" ({ttype})" if ttype and ttype.lower() not in role.lower() else "")
+                                    track_subtask(label[:160], False)
+                                elif tname == "swarm":
+                                    act = str(params.get("action") or "").lower()
+                                    if act == "add":
+                                        base = str(params.get("name") or "worker").strip()
+                                        model = str(params.get("model") or "").strip()
+                                        tasks_arg = params.get("tasks") or []
+                                        n_arg = int(params.get("n") or 1)
+                                        count = len(tasks_arg) if isinstance(tasks_arg, list) and tasks_arg else n_arg
+                                        names = [f"{base}-{i}" for i in range(1, count + 1)] if count > 1 else [base]
+                                        for mname in names:
+                                            label = f"[swarm] {mname}" + (f" ({model})" if model else "")
+                                            swarm_members[mname] = label[:160]
+                                            track_subtask(label[:160], False)
+                                    elif act == "kill":
+                                        mname = str(params.get("name") or "").strip()
+                                        if mname in swarm_members:
+                                            track_subtask(swarm_members[mname], True)
+                                elif tname == "run_workflow":
+                                    desc = str(params.get("Description") or "workflow").strip()
+                                    label = f"[workflow] {desc[:120]}"
+                                    workflow_steps[sidx] = label
+                                    track_subtask(label, False)
+                            elif tstate == "DONE":
+                                out_text = str(tinfo.get("output") or "")
+                                if tname == "run_workflow" and sidx in workflow_steps:
+                                    if "background" not in out_text.lower():
+                                        track_subtask(workflow_steps[sidx], True)
+                                elif tname == "run_command" and "background task" in out_text.lower():
+                                    summary = str(params.get("toolSummary") or params.get("CommandLine") or "command").strip()
+                                    track_subtask(f"[bg] {summary[:120]}", False)
+                                elif tname == "manage_subagents" and str(params.get("Action") or "").lower() == "kill_all":
+                                    for lbl in list(open_subtasks):
+                                        if lbl.startswith("[subagent]") and not open_subtasks[lbl]:
+                                            track_subtask(lbl, True)
                         elif su.get("step_type") == "agent_response" and su.get("text_delta"):
                             delta = su["text_delta"]
                             sidx = int(su.get("step_index") or 0)
@@ -258,6 +319,12 @@ class AgyAgent(AgentProvider):
                 )
 
             status = str(result_payload.get("status") or "SUCCESS").upper()
+            if status == "SUCCESS":
+                # Any subagents, swarm workers, workflows, or background tasks launched during
+                # a clean turn have finished by the time the turn ends; mark them checked.
+                for lbl, is_done in list(open_subtasks.items()):
+                    if not is_done:
+                        track_subtask(lbl, True)
             # Use only the final agent_response step so intermediate background-wait chatter
             # (e.g. "Running cargo test... waiting for build to finish.") doesn't pollute the reply.
             final_step_text = "".join(step_texts.get(last_text_step, [])).strip() if last_text_step is not None else ""
@@ -295,6 +362,7 @@ class AgyAgent(AgentProvider):
         log_dir: Path,
         timeout: int,
         procs: set,
+        on_subtask: Callable[[str, str, bool], None] | None = None,
     ) -> AgentResult:
         if resume:
             full_prompt = (
@@ -340,6 +408,7 @@ class AgyAgent(AgentProvider):
             procs=procs,
             on_progress=on_progress,
             on_session_id=on_session_id,
+            on_subtask=on_subtask,
             log_dir=log_dir,
             known_session_id=session_id if resume else None,
         )

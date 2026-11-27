@@ -182,6 +182,99 @@ class TestClaudeAgent(unittest.TestCase):
             self.assertIn("- Read:", calls[0])
             self.assertIn("- Bash [ERROR/DENIED]:", calls[1])
 
+    def test_live_subtask_sync_for_agents_and_todowrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            events = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu_agent_ok",
+                                "name": "Agent",
+                                "input": {"description": "Check auth flow", "subagent_type": "Explore"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "tu_agent_err",
+                                "name": "Task",
+                                "input": {"description": "Explore flaky check", "subagent_type": "Explore"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "tu_todo_1",
+                                "name": "TodoWrite",
+                                "input": {
+                                    "todos": [
+                                        {"content": "Write tests", "status": "in_progress"},
+                                        {"content": "Update docs", "status": "pending"},
+                                    ]
+                                },
+                            },
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "tu_agent_ok", "is_error": False},
+                            {"type": "tool_result", "tool_use_id": "tu_agent_err", "is_error": True},
+                        ]
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu_todo_2",
+                                "name": "TodoWrite",
+                                "input": {
+                                    "todos": [
+                                        {"content": "Write tests", "status": "completed"},
+                                        {"content": "Update docs", "status": "pending"},
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                },
+                {"type": "result", "subtype": "success", "is_error": False, "result": "Done.\nSTATUS: DONE"},
+            ]
+            fake_cmd = [
+                sys.executable,
+                "-c",
+                "import sys; print(" + repr("\n".join(json.dumps(e) for e in events)) + ")",
+            ]
+            captured: list[tuple[str, str, bool]] = []
+            agent = ClaudeAgent(claude_bin=sys.executable, mode="host", base_env={})
+            res = agent._run_streaming(
+                cmd=fake_cmd,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_path=tmp_path / "s.jsonl",
+                session_id="s",
+                on_subtask=lambda cl, text, done: captured.append((cl, text, done)),
+            )
+            self.assertFalse(res.is_error)
+            self.assertEqual(
+                captured,
+                [
+                    ("Subagents & Tasks", "[subagent] Check auth flow (Explore)", False),
+                    ("Subagents & Tasks", "[subagent] Explore flaky check", False),
+                    ("Subagents & Tasks", "Write tests", False),
+                    ("Subagents & Tasks", "Update docs", False),
+                    ("Subagents & Tasks", "[subagent] Check auth flow (Explore)", True),
+                    ("Subagents & Tasks", "Write tests", True),
+                ],
+            )
+
 
 class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
     def test_agy_strips_intermediate_background_wait_chatter(self):
@@ -246,6 +339,105 @@ class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
             self.assertEqual(res.session_id, "conv-abc")
             self.assertNotIn("waiting for build to finish", res.text)
             self.assertEqual(res.text, "Implemented the Rust notifier.\nSTATUS: DONE")
+
+    def test_agy_live_subtask_sync_on_success_and_error(self):
+        def _step(idx: int, name: str, state: str, params: dict, output: str = "") -> dict:
+            return {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv-sub",
+                    "step_index": idx,
+                    "state": state,
+                    "step_type": "tool",
+                    "tool_name": name,
+                    "tool_info": {"name": name, "parameters": params, "output": output},
+                },
+            }
+
+        base_events = [
+            {"event": "init", "conversation_id": "conv-sub"},
+            _step(1, "invoke_subagent", "ACTIVE", {"Role": "Codebase Researcher", "TypeName": "research"}),
+            _step(2, "invoke_subagent", "ACTIVE", {"Role": "API Auditor", "TypeName": "self"}),
+            _step(3, "swarm", "ACTIVE", {"action": "add", "name": "dev", "model": "medium", "n": 2}),
+            _step(4, "swarm", "ACTIVE", {"action": "kill", "name": "dev-1"}),
+            _step(5, "run_workflow", "ACTIVE", {"Description": "Fan out lint checks"}),
+            _step(5, "run_workflow", "DONE", {"Description": "Fan out lint checks"}, output="All checks passed"),
+            _step(
+                6,
+                "run_command",
+                "DONE",
+                {"toolSummary": "Cargo test build", "CommandLine": "cargo test"},
+                output="Tool is running as a background task (id: bg-1)",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            agent = AgyAgent(agy_bin=sys.executable, base_env={})
+
+            # 1) Clean SUCCESS auto-completes remaining open subtasks
+            ok_events = base_events + [
+                {"event": "result", "result": {"conversation_id": "conv-sub", "status": "SUCCESS", "response": "Done"}}
+            ]
+            ok_cmd = [sys.executable, "-c", "print(" + repr("\n".join(json.dumps(e) for e in ok_events)) + ")"]
+            ok_captured: list[tuple[str, str, bool]] = []
+            res_ok = agent._run_streaming(
+                cmd=ok_cmd,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_dir=tmp_path,
+                on_subtask=lambda cl, text, done: ok_captured.append((cl, text, done)),
+            )
+            self.assertFalse(res_ok.is_error)
+            self.assertEqual(
+                ok_captured,
+                [
+                    ("Subagents & Tasks", "[subagent] Codebase Researcher", False),
+                    ("Subagents & Tasks", "[subagent] API Auditor (self)", False),
+                    ("Subagents & Tasks", "[swarm] dev-1 (medium)", False),
+                    ("Subagents & Tasks", "[swarm] dev-2 (medium)", False),
+                    ("Subagents & Tasks", "[swarm] dev-1 (medium)", True),
+                    ("Subagents & Tasks", "[workflow] Fan out lint checks", False),
+                    ("Subagents & Tasks", "[workflow] Fan out lint checks", True),
+                    ("Subagents & Tasks", "[bg] Cargo test build", False),
+                    ("Subagents & Tasks", "[subagent] Codebase Researcher", True),
+                    ("Subagents & Tasks", "[subagent] API Auditor (self)", True),
+                    ("Subagents & Tasks", "[swarm] dev-2 (medium)", True),
+                    ("Subagents & Tasks", "[bg] Cargo test build", True),
+                ],
+            )
+
+            # 2) Non-SUCCESS status leaves still-open subtasks unchecked
+            err_events = base_events + [
+                {"event": "result", "result": {"conversation_id": "conv-sub", "status": "ERROR", "error": "boom"}}
+            ]
+            err_cmd = [sys.executable, "-c", "print(" + repr("\n".join(json.dumps(e) for e in err_events)) + ")"]
+            err_captured: list[tuple[str, str, bool]] = []
+            res_err = agent._run_streaming(
+                cmd=err_cmd,
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_dir=tmp_path,
+                on_subtask=lambda cl, text, done: err_captured.append((cl, text, done)),
+            )
+            self.assertTrue(res_err.is_error)
+            self.assertEqual(
+                err_captured,
+                [
+                    ("Subagents & Tasks", "[subagent] Codebase Researcher", False),
+                    ("Subagents & Tasks", "[subagent] API Auditor (self)", False),
+                    ("Subagents & Tasks", "[swarm] dev-1 (medium)", False),
+                    ("Subagents & Tasks", "[swarm] dev-2 (medium)", False),
+                    ("Subagents & Tasks", "[swarm] dev-1 (medium)", True),
+                    ("Subagents & Tasks", "[workflow] Fan out lint checks", False),
+                    ("Subagents & Tasks", "[workflow] Fan out lint checks", True),
+                    ("Subagents & Tasks", "[bg] Cargo test build", False),
+                ],
+            )
 
     def test_extract_checklists_and_done_command_regex(self):
         import os

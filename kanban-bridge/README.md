@@ -19,7 +19,9 @@ A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`**
   6. **Auditing** — **manual audit trigger**; drag any card here to run the read-only auditor (clean → **Pending**, problems → **Flagged**)
   7. **Done** *(closed list)* — **never entered automatically**; only moved here when you drag the card manually or comment `done` / `mark done` / `move to done` / `close` (0 tokens)
   8. **Flagged** — auditor found issues (`audit:<flag>` red labels + desktop notification)
-- **Native Planka Checklists (`CHECKLIST:`):** Agents can include `CHECKLIST: <Title>` blocks with `- [x]` / `- [ ]` items before `STATUS:`, which the bridge syncs to Planka's native Task Lists (`showOnFrontOfCard: true`) so you see progress right on the card face.
+- **Native Planka Checklists (`CHECKLIST:` + Live `Subagents & Tasks`):**
+  - **Live automatic tracking:** Whenever an agent spawns a subagent, swarm worker, workflow, or background command (`agy`: `invoke_subagent`, `swarm`, `run_workflow`, backgrounded `run_command`; `claude`: `Agent`/`Task`, `TodoWrite`), the bridge syncs each one live into a **`Subagents & Tasks`** Task List on the card (`showOnFrontOfCard: true`) and checks items off as they finish (or on clean turn completion).
+  - **Explicit `CHECKLIST:` blocks:** Agents can also include `CHECKLIST: <Title>` blocks with `- [x]` / `- [ ]` items before `STATUS:` to sync deliverables/follow-ups onto the card face.
 - **Pre-Run Intake (`⚙️ Configure this run` — 0 tokens):** When a brand-new `agy` card doesn't yet specify both a workspace choice (`worktree` / `in-place` / `scratch`) and execution mode (`plan-first` / `direct`), the bridge posts a signed 1-click setup form link (`http://localhost:8787/setup?...`) on the card (plus comment-reply shortcuts like `clerk worktree plan-first`) and moves it to **Need Action** before spending any agent tokens. Cards that already have those labels start immediately.
 - **Git Tracking & Isolated Repos (`~/workspace/kanban-bridge/repos/`):**
   - **Standalone scratch cards (`scratch`):** Each card gets its own git repo in `~/workspace/kanban-tasks/task-<id>-<slug>/` (one commit per run).

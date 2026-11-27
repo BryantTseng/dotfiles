@@ -1401,30 +1401,54 @@ def run_task(
                 attached_session_id = cid
                 log.info("task %s: attached session label %s", task_id, cid)
 
+        subtask_q: queue.Queue[tuple[str, str, bool] | None] = queue.Queue()
+
+        def _subtask_worker():
+            while True:
+                item = subtask_q.get()
+                if item is None:
+                    return
+                cl_name, cl_text, cl_done = item
+                try:
+                    BOARD.sync_checklist(task_id, cl_name, [(cl_text, cl_done)])
+                except Exception:
+                    log.warning("task %s: live subtask checklist sync failed", task_id, exc_info=True)
+
+        subtask_thread = threading.Thread(target=_subtask_worker, daemon=True)
+
+        def on_subtask(cl_name: str, cl_text: str, cl_done: bool):
+            subtask_q.put((cl_name, cl_text, cl_done))
+
         try:
             cwd, repo_ctx = ensure_task_workspace(task)
             BOARD.move_to(task, BUCKET_DOING)
             BOARD.remove_labels(task, lambda t: t == AUDITED_LABEL)
 
-            with tempfile.TemporaryDirectory() as tmp:
-                creds_env, cred_errors = credentials_for(granted, tmp)
-                extra_env = dict(creds_env)
-                if repo_ctx and SHARE_CARGO_TARGET and (cwd / "Cargo.toml").exists():
-                    extra_env.setdefault("CARGO_TARGET_DIR", str(repo_ctx["repo_path"] / "target"))
-                result = AGENT.run_task(
-                    task=task,
-                    session_id=session_id,
-                    prompt=prompt,
-                    system_instructions=system_prompt(task, granted, cwd, repo_ctx=repo_ctx, plan_only=plan_only),
-                    resume=resume,
-                    cwd=cwd,
-                    env_extra=extra_env,
-                    on_progress=progress,
-                    on_session_id=on_session_id,
-                    log_dir=LOGS_DIR,
-                    timeout=RUN_TIMEOUT,
-                    procs=_procs,
-                )
+            subtask_thread.start()
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    creds_env, cred_errors = credentials_for(granted, tmp)
+                    extra_env = dict(creds_env)
+                    if repo_ctx and SHARE_CARGO_TARGET and (cwd / "Cargo.toml").exists():
+                        extra_env.setdefault("CARGO_TARGET_DIR", str(repo_ctx["repo_path"] / "target"))
+                    result = AGENT.run_task(
+                        task=task,
+                        session_id=session_id,
+                        prompt=prompt,
+                        system_instructions=system_prompt(task, granted, cwd, repo_ctx=repo_ctx, plan_only=plan_only),
+                        resume=resume,
+                        cwd=cwd,
+                        env_extra=extra_env,
+                        on_progress=progress,
+                        on_session_id=on_session_id,
+                        log_dir=LOGS_DIR,
+                        timeout=RUN_TIMEOUT,
+                        procs=_procs,
+                        on_subtask=on_subtask,
+                    )
+            finally:
+                subtask_q.put(None)
+                subtask_thread.join(timeout=10)
             if result.session_id and not attached_session_id and new_session:
                 on_session_id(result.session_id)
 

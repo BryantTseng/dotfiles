@@ -193,6 +193,7 @@ class AgentProvider(ABC):
         log_dir: Path,
         timeout: int,
         procs: set,
+        on_subtask: Callable[[str, str, bool], None] | None = None,
     ) -> AgentResult:
         """Run one agent turn on `task` inside `cwd`."""
 

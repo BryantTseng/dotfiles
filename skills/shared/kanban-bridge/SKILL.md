@@ -105,6 +105,7 @@ $KANBAN delete <card_id>
   - Scratch cards: `~/workspace/kanban-tasks/task-<id>-<slug>/`
   - Repo-backed cards (`repo:<name>` + `worktree` or `in-place`): isolated `git worktree` at `~/workspace/kanban-tasks/<repo>-task-<id>-<slug>/` on branch `kanban/<id-tail>-<slug>` with shared `CARGO_TARGET_DIR` (clean up after PR merge with `git -C ~/workspace/kanban-bridge/repos/<repo> worktree remove <path>`).
 - **Plan-first workflow:** Attach `plan-first` to run spec/Q&A first without modifying production code; replying `do it` / `proceed` automatically removes `plan-first` and unlocks implementation.
+- **Live Task Lists (`Subagents & Tasks`):** Subagents, swarm workers, workflows, backgrounded commands (`agy`), and `Agent`/`Task`/`TodoWrite` calls (`claude`) automatically stream live into a native `Subagents & Tasks` checklist on the card (`showOnFrontOfCard: true`) and check off when finished.
 - **Host audit logs:** `~/.local/share/kanban-bridge/logs/<conversation-id>.jsonl`
 - **Service commands:**
   ```bash
