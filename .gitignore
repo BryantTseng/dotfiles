@@ -2,3 +2,4 @@
 **/__pycache__
 *.pyc
 kanban-bridge/repos/
+kanban-bridge/agent/ca-bundle.pem

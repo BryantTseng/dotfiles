@@ -100,6 +100,15 @@ class AgentResult:
     is_error: bool = False
 
 
+@dataclass
+class SubagentAudit:
+    id: str
+    name: str
+    prompt: str = ""
+    tool_calls: list[str] = field(default_factory=list)
+    final_report: str = ""
+
+
 class BoardProvider(ABC):
     """Abstract interface for a kanban board backend (Planka, Trello, Linear, etc.)."""
 
@@ -148,7 +157,9 @@ class BoardProvider(ABC):
         """Attach a label to a card, creating the label first if needed."""
 
     @abstractmethod
-    def attach_session_label(self, task_id: str, session_id: str, prefix: str, color: str) -> None:
+    def attach_session_label(
+        self, task_id: str, session_id: str, prefix: str, color: str, provider: str = "agy"
+    ) -> None:
         """Persist the session/conversation ID on the card."""
 
     @abstractmethod
@@ -233,9 +244,19 @@ class AgentProvider(ABC):
     ) -> str:
         """Run a read-only audit pass over `dossier` in `cwd` and return its markdown output."""
 
+    def agent_workdir(self, cwd: Path) -> Path:
+        """Return the directory path where the agent sees `cwd` (e.g. `/work` in Docker)."""
+        return cwd
+
     @abstractmethod
     def extract_tool_calls(self, session_id: str, log_dir: Path) -> list[str]:
         """Return human-readable tool-call lines from the host-side audit log for `session_id`."""
+
+    def extract_subagent_audits(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> list[SubagentAudit]:
+        """Return per-subagent prompts, tool calls, and final reports for the auditor dossier."""
+        return []
 
     def force_cleanup(self) -> None:
         """Optional cleanup of leftover agent processes/containers on startup or forced stop."""

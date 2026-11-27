@@ -7,18 +7,19 @@ A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`**
 ## Architecture & Workflow
 
 - **Live Board UI:** Self-hosted Planka v2 (`http://localhost:3000`) backed by PostgreSQL 16 with real-time WebSocket auto-refresh (no manual page reloads).
-- **Trigger:** Applying the **`agy`** label to any open card starts a headless `agy -p --output-format stream-json --sandbox` session in `~/workspace/kanban-tasks/task-<id>-<slug>/`.
-- **Session Persistence:** The `agy` `conversation_id` is stored invisibly at the bottom of the card description as `<!-- agy-session:<uuid> -->` (keeping Planka's label picker clean). Every human comment on the card resumes that exact session with `--conversation <uuid>`.
-- **Bot User:** Card moves, live checklist updates, labels, and replies are performed as a dedicated Planka `boardUser` (**`agy`**, board `editor` role) so Planka's **Actions** feed cleanly separates **`Agy`**'s automated updates from your manual drags/edits.
-- **Columns (Board `Agy`):**
-  1. **Backlog** — unscheduled ideas
+- **Trigger:** Applying the configured trigger label (`BRIDGE_TRIGGER_LABEL`, default `agy` — or `claude`) to any open card outside **Backlog** starts a headless `agy --sandbox` or `claude` session in `~/workspace/kanban-tasks/task-<id>-<slug>/`.
+- **Session Persistence:** The session/conversation ID is stored invisibly at the bottom of the card description as `<!-- <provider>-session:<uuid> -->` (`agy-session` or `claude-session`), keeping Planka's label picker clean. Every human comment on the card resumes that exact session.
+- **Bot User:** Card moves, live checklist updates, labels, attachments, and replies are performed as a dedicated Planka `boardUser` (`BOT_USERNAME`, board `editor` role) so Planka's **Actions** feed cleanly separates bot updates from your manual drags/edits.
+- **Columns:**
+  1. **Backlog** — **parked / drafts**; ignored by the bridge even if carrying the trigger label (configurable via `BRIDGE_BACKLOG_BUCKET=backlog`) until moved out
   2. **To-Do** — ready / waiting (`⏳ Queued` comment if 2 slots are busy)
-  3. **Need Action** — agent asked a question, requested access, needs `/setup` config, or failed (fires `notify-send`)
+  3. **Need Action** — agent asked a question, requested access, needs `/setup` config, or failed
   4. **Doing** — actively running (30-second live progress updates on placeholder comment)
   5. **Pending** — agent finished its run (`STATUS: DONE`) or passed **Auditing**; ready for **your** review, live test, or deployment
-  6. **Auditing** — **manual audit trigger**; drag any card here to run the read-only auditor (clean → **Pending**, problems → **Flagged**)
+  6. **Auditing** — **manual audit trigger**; drag any card here to run the read-only auditor across the parent run **and** every spawned subagent (clean → **Pending**, problems → **Flagged**)
   7. **Done** *(closed list)* — **never entered automatically**; only moved here when you drag the card manually or comment `done` / `mark done` / `move to done` / `close` (0 tokens)
-  8. **Flagged** — auditor found issues (`audit:<flag>` red labels + desktop notification)
+  8. **Flagged** — auditor found issues (`audit:<flag>` red labels)
+- **Notifications:** Linux uses `notify-send` when `BRIDGE_NOTIFY=auto` (default); set `BRIDGE_NOTIFY=off` to disable desktop popups (e.g. on macOS when using the optional `swiftbar/kanban.30s.py` menu-bar plugin).
 - **Native Planka Checklists (`CHECKLIST:` + Live `Subagents & Tasks`):**
   - **Live automatic tracking:** Whenever an agent spawns a subagent, swarm worker, workflow, or background command (`agy`: `invoke_subagent`, `swarm`, `run_workflow`, backgrounded `run_command`; `claude`: `Agent`/`Task`, `TodoWrite`), the bridge syncs each one live into a **`Subagents & Tasks`** Task List on the card (`showOnFrontOfCard: true`) and checks items off as they finish (or on clean turn completion).
   - **Explicit `CHECKLIST:` blocks:** Agents can also include `CHECKLIST: <Title>` blocks with `- [x]` / `- [ ]` items before `STATUS:` to sync deliverables/follow-ups onto the card face.
@@ -52,7 +53,9 @@ kanban-bridge/
 │   ├── agy.py                # Host `agy --sandbox` provider + read-only auditor
 │   └── claude.py             # Claude Code provider (Docker+auth-proxy or host mode) + auditor
 ├── agent/
-│   └── Dockerfile            # Isolated container image for Claude Code (`kanban-agent:latest`)
+│   └── Dockerfile            # Isolated container image for Claude Code (`kanban-agent:latest`, optional `ca-bundle.pem`)
+├── swiftbar/
+│   └── kanban.30s.py         # Optional macOS SwiftBar menu-bar status & quick-jump plugin
 ├── planka/
 │   ├── docker-compose.yml    # Planka v2 + PostgreSQL 16 (localhost-only, --net=host)
 │   └── setup-planka.sh       # Interactive one-time setup (API keys, bot user, board & lists)
@@ -113,13 +116,20 @@ Open **http://localhost:3000**, open the **Agy** board, create a card in **To-Do
 
 ## Daily Operations & Backups
 
-### Service Management
-```bash
-systemctl --user status kanban-bridge
-systemctl --user restart kanban-bridge
-systemctl --user stop kanban-bridge
-journalctl --user -u kanban-bridge -f
-```
+### Service Management (Linux `systemd` vs. macOS `run.sh` + SwiftBar)
+- **Linux (`systemd` user service):**
+  ```bash
+  systemctl --user status|restart|stop kanban-bridge
+  journalctl --user -u kanban-bridge -f
+  ```
+- **macOS (`run.sh` + optional SwiftBar menu-bar plugin):**
+  ```bash
+  ~/workspace/kanban-bridge/run.sh
+  # Optional SwiftBar plugin (shows Need Action / Flagged / Doing / Auditing counts & click-through links):
+  ln -sf ~/workspace/kanban-bridge/swiftbar/kanban.30s.py ~/Library/Application\ Support/SwiftBar/kanban.30s.py
+  ```
+  Set `BRIDGE_NOTIFY=off` in `~/.config/kanban-bridge/env` when using SwiftBar.
+  Behind corporate TLS inspection (e.g. Netskope/Zscaler), place your PEM CA bundle at `~/workspace/kanban-bridge/agent/ca-bundle.pem` (gitignored) before building `kanban-agent:latest`.
 
 ### Backup & Restore
 State lives in four places:

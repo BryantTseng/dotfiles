@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from providers import (
+    Attachment,
     Task,
     is_valid_proxy_token,
     load_agent_provider,
@@ -678,6 +679,237 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
             self.assertTrue(att.is_image)
             self.assertEqual(seen_req[0].full_url, "http://127.0.0.1:3000/api/cards/c1/attachments")
             self.assertEqual(seen_req[0].headers.get("X-api-key"), "bot-key")
+
+    def test_provider_specific_session_marker(self):
+        board = PlankaBoard(
+            base_url="http://127.0.0.1:3000",
+            api_key="admin-key",
+            webhook_url="http://127.0.0.1:8787/planka",
+            webhook_secret="sec",
+            bot_api_key="bot-key",
+            bot_username="claude",
+        )
+        patched_descs: list[str] = []
+
+        def fake_api(method: str, path: str, payload=None, *, api_key=None):
+            if method == "GET":
+                return {"item": {"id": "c1", "description": "Card body"}}
+            if method == "PATCH":
+                patched_descs.append(payload["description"])
+                return {"item": {}}
+            return {}
+
+        board._api = fake_api  # type: ignore[method-assign]
+        board.attach_session_label("c1", "sess-claude", "session:", "grey", provider="claude")
+        board.attach_session_label("c1", "sess-agy", "session:", "grey", provider="agy")
+        self.assertEqual(patched_descs[0], "Card body\n\n<!-- claude-session:sess-claude -->")
+        self.assertEqual(patched_descs[1], "Card body\n\n<!-- agy-session:sess-agy -->")
+
+
+class TestCrossPlatformWorkdirBacklogAndSubagentAudits(unittest.TestCase):
+    def test_agent_workdir_for_agy_and_claude_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            scratch = root / "scratch"
+            scratch.mkdir()
+
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-q", "-m", "init"],
+                cwd=repo,
+                check=True,
+            )
+            wt = root / "wt"
+            subprocess.run(["git", "-C", str(repo), "worktree", "add", "-b", "feat/wt", str(wt)], capture_output=True, check=True)
+
+            agy = AgyAgent(agy_bin=sys.executable, base_env={})
+            self.assertEqual(agy.agent_workdir(scratch), scratch)
+
+            claude_host = ClaudeAgent(claude_bin=sys.executable, mode="host", base_env={})
+            self.assertEqual(claude_host.agent_workdir(scratch), scratch)
+
+            claude_docker = ClaudeAgent(claude_bin=sys.executable, mode="docker", base_env={})
+            self.assertEqual(claude_docker.agent_workdir(scratch), Path("/work"))
+            self.assertEqual(claude_docker.agent_workdir(wt), wt)
+
+    def test_docker_workdir_mapping_for_inbound_and_outbound_attachments(self):
+        import os
+
+        os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+        import bridge
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            cwd = root / "task"
+            (cwd / "out").mkdir(parents=True)
+            (cwd / ".kanban-attachments").mkdir(parents=True)
+            chart = cwd / "out" / "chart.png"
+            chart.write_bytes(b"\x89PNGDATA")
+            inbound = cwd / ".kanban-attachments" / "123456-spec.png"
+            inbound.write_bytes(b"\x89PNGIN")
+            outside = root / "secret.txt"
+            outside.write_text("nope", encoding="utf-8")
+
+            # Container path `/work/out/chart.png` maps cleanly to host `cwd/out/chart.png`
+            res, err = bridge.resolve_attachable_path("/work/out/chart.png", cwd, agent_cwd=Path("/work"))
+            self.assertIsNone(err)
+            self.assertEqual(res, chart)
+
+            # Traversal climbing out of `/work` is still rejected
+            res, err = bridge.resolve_attachable_path("/work/../secret.txt", cwd, agent_cwd=Path("/work"))
+            self.assertIsNone(res)
+            self.assertIsNotNone(err)
+
+            # Inbound prompt block renders `/work/.kanban-attachments/...` in Docker mode
+            block = bridge.format_inbound_attachments(
+                [Attachment(id="1", name="spec.png", kind="file", is_image=True, size_bytes=6, local_path=inbound)],
+                host_cwd=cwd,
+                agent_cwd=Path("/work"),
+            )
+            self.assertIn("`/work/.kanban-attachments/123456-spec.png`", block)
+
+    def test_backlog_parking_ignores_cards_in_backlog(self):
+        import os
+        from unittest import mock
+
+        os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+        import bridge
+
+        t = Task(id="7", title="Draft", project_id="b1")
+        fake_backlog = mock.Mock(current_bucket=mock.Mock(return_value="backlog"))
+        with mock.patch.object(bridge, "BOARD", fake_backlog, create=True):
+            self.assertTrue(bridge.is_parked_in_backlog(t))
+            self.assertFalse(bridge.needs_work(t))
+        fake_todo = mock.Mock(current_bucket=mock.Mock(return_value="to-do"))
+        with mock.patch.object(bridge, "BOARD", fake_todo, create=True):
+            self.assertFalse(bridge.is_parked_in_backlog(t))
+
+    def test_claude_subagent_audit_extraction_separates_parent_and_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            events = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "id": "tu_parent", "name": "Read", "input": {"file_path": "/work/a.py"}},
+                            {
+                                "type": "tool_use",
+                                "id": "tu_sub",
+                                "name": "Agent",
+                                "input": {
+                                    "description": "Audit deps",
+                                    "subagent_type": "Explore",
+                                    "prompt": "Check Cargo.toml for risky deps",
+                                },
+                            },
+                        ]
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "parent_tool_use_id": "tu_sub",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "id": "tu_child_1", "name": "Bash", "input": {"command": "cargo tree"}},
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "parent_tool_use_id": "tu_sub",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "tu_child_1", "is_error": True},
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tu_sub",
+                                "content": [{"type": "text", "text": "No risky deps found."}],
+                            }
+                        ]
+                    },
+                },
+            ]
+            (log_dir / "sess-sub.jsonl").write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+
+            agent = ClaudeAgent(claude_bin=sys.executable, mode="host", base_env={}, state_root=log_dir / "state")
+            parent_calls = agent.extract_tool_calls("sess-sub", log_dir)
+            self.assertEqual(len(parent_calls), 2)
+            self.assertFalse(any("cargo tree" in c for c in parent_calls))
+
+            subs = agent.extract_subagent_audits("sess-sub", log_dir)
+            self.assertEqual(len(subs), 1)
+            self.assertEqual(subs[0].name, "Audit deps (Explore)")
+            self.assertEqual(subs[0].prompt, "Check Cargo.toml for risky deps")
+            self.assertEqual(len(subs[0].tool_calls), 1)
+            self.assertIn("- Bash [ERROR/DENIED]:", subs[0].tool_calls[0])
+            self.assertEqual(subs[0].final_report, "No risky deps found.")
+
+    def test_agy_subagent_audit_extraction_reads_child_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child_log = root / "child-transcript.jsonl"
+            child_steps = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls -la"}}],
+                },
+                {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "ok"},
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [
+                        {"name": "send_message", "args": {"Message": '"Only .git exists."', "Recipient": '"parent"'}}
+                    ],
+                },
+            ]
+            child_log.write_text("\n".join(json.dumps(s) for s in child_steps), encoding="utf-8")
+
+            parent_events = [
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": "parent-1",
+                        "step_index": 2,
+                        "state": "DONE",
+                        "step_type": "subagent",
+                        "tool_name": "invoke_subagent",
+                        "subagent_info": {
+                            "subagents": [
+                                {
+                                    "type_name": "research",
+                                    "role": "Smoke Test Researcher",
+                                    "initial_prompt": "Inspect scratch dir",
+                                    "conversation_id": "child-1",
+                                    "log_uri": f"file://{child_log}",
+                                }
+                            ]
+                        },
+                    },
+                }
+            ]
+            (root / "parent-1.jsonl").write_text("\n".join(json.dumps(e) for e in parent_events), encoding="utf-8")
+
+            agent = AgyAgent(agy_bin=sys.executable, base_env={})
+            subs = agent.extract_subagent_audits("parent-1", root)
+            self.assertEqual(len(subs), 1)
+            self.assertEqual(subs[0].name, "Smoke Test Researcher")
+            self.assertEqual(subs[0].prompt, "Inspect scratch dir")
+            self.assertEqual(len(subs[0].tool_calls), 2)
+            self.assertIn("- run_command:", subs[0].tool_calls[0])
+            self.assertEqual(subs[0].final_report, "Only .git exists.")
 
 
 if __name__ == "__main__":

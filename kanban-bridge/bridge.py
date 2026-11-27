@@ -30,7 +30,6 @@ import logging
 import os
 import queue
 import re
-import secrets
 import shutil
 import signal
 import ssl
@@ -133,6 +132,7 @@ PH_AUDIT = f"{PH} **🔍 Audit**: _reviewing…_"
 LEGACY_PLACEHOLDERS = ("Working on it…", "🔍 Audit: reviewing…")
 
 # Board column names (lower-cased)
+BUCKET_BACKLOG = ENV.get("BRIDGE_BACKLOG_BUCKET", "backlog").strip().lower()
 BUCKET_PLANNING = ENV.get("BRIDGE_PLANNING_BUCKET", "planning").strip().lower()
 BUCKET_DOING = "doing"
 BUCKET_NEEDS_ACTION = "need action"
@@ -430,7 +430,9 @@ def system_prompt(
     cwd: Path,
     repo_ctx: dict | None = None,
     plan_only: bool = False,
+    agent_cwd: Path | None = None,
 ) -> str:
+    view_cwd = agent_cwd or cwd
     profiles = ", ".join(readonly_aws_profiles()) or "(none found)"
     parts = [
         f"You are working on kanban card #{task.id} through a headless bridge. "
@@ -444,14 +446,14 @@ def system_prompt(
     if repo_ctx:
         if repo_ctx.get("mode") == INPLACE_LABEL:
             loc_line = (
-                f"You are working **in-place** inside repository `{repo_ctx['name']}` at `{cwd}` "
+                f"You are working **in-place** inside repository `{repo_ctx['name']}` at `{view_cwd}` "
                 f"(current branch: `{repo_ctx['branch']}`). Do NOT discard unrelated uncommitted user "
                 "changes; create or switch to a feature branch before making commits. "
             )
         else:
             loc_line = (
                 f"You are working inside an isolated `git worktree` of repository `{repo_ctx['name']}` "
-                f"at `{cwd}` on feature branch `{repo_ctx['branch']}` (branched from `{repo_ctx['base_ref']}`). "
+                f"at `{view_cwd}` on feature branch `{repo_ctx['branch']}` (branched from `{repo_ctx['base_ref']}`). "
             )
         parts.append(
             loc_line + "ONLY modify files inside this repository directory.\n"
@@ -468,7 +470,7 @@ def system_prompt(
         )
     else:
         parts.append(
-            f"Your working directory (`{cwd}`) is the standalone task directory and the ONLY place "
+            f"Your working directory (`{view_cwd}`) is the standalone task directory and the ONLY place "
             "you may modify files. It is a git repository and the bridge commits your changes after "
             "each run, so do NOT run `git commit` or rewrite git history yourself."
         )
@@ -506,12 +508,12 @@ def system_prompt(
 
     parts.append(
         "Card attachments & generated files:\n"
-        f"- Any images, PDFs, or files attached to this card are downloaded by the bridge into `{cwd / ATTACHMENTS_DIR_NAME}` "
+        f"- Any images, PDFs, or files attached to this card are downloaded by the bridge into `{view_cwd / ATTACHMENTS_DIR_NAME}` "
         "(excluded from git). Read them directly with your file viewer when relevant.\n"
         "- Whenever the user asks you to generate or share an image, diagram, chart, or file on the card, "
-        "save/generate it and add one `ATTACH:` line per file before the status line:\n"
-        "ATTACH: <relative-or-absolute-path>\n"
-        "(or `ATTACH: <path> | <display name>`). The bridge uploads those files directly to the card as attachments."
+        "save/generate it and add one `ATTACH:` line per file before the status line using a path relative to your working directory:\n"
+        "ATTACH: <relative-path>\n"
+        "(or `ATTACH: <relative-path> | <display name>`). The bridge uploads those files directly to the card as attachments."
     )
 
     parts.append(
@@ -589,13 +591,30 @@ def extract_attachments(text: str) -> tuple[str, list[tuple[str, str | None]]]:
 
 
 def resolve_attachable_path(
-    raw_path: str, cwd: Path, session_id: str | None = None
+    raw_path: str,
+    cwd: Path,
+    session_id: str | None = None,
+    agent_cwd: Path | None = None,
 ) -> tuple[Path | None, str | None]:
-    """Validate an agent-requested `ATTACH:` path against workspace/session-brain boundaries."""
+    """Validate an agent-requested `ATTACH:` path against workspace/session-brain boundaries.
+
+    When `agent_cwd` differs from host `cwd` (e.g. Docker container sees `/work`), paths inside
+    `agent_cwd` are mapped back onto host `cwd` before resolving and enforcing workspace boundaries.
+    """
     p_str = raw_path.strip()
     if p_str.startswith("file://"):
         p_str = p_str[len("file://") :]
     p = Path(p_str).expanduser()
+    if p.is_absolute() and agent_cwd is not None:
+        # Lexically normalize before checking container prefix so `/work/../etc/passwd` cannot escape.
+        norm_p = Path(os.path.normpath(str(p)))
+        norm_agent = Path(os.path.normpath(str(agent_cwd)))
+        if norm_agent != cwd.resolve():
+            try:
+                rel = norm_p.relative_to(norm_agent)
+                p = cwd / rel
+            except ValueError:
+                pass
     if not p.is_absolute():
         p = cwd / p
     try:
@@ -632,7 +651,11 @@ def resolve_attachable_path(
     return resolved, None
 
 
-def format_inbound_attachments(attachments: list) -> str:
+def format_inbound_attachments(
+    attachments: list,
+    host_cwd: Path | None = None,
+    agent_cwd: Path | None = None,
+) -> str:
     """Render a compact prompt block listing downloaded card attachments and links."""
     if not attachments:
         return ""
@@ -640,14 +663,21 @@ def format_inbound_attachments(attachments: list) -> str:
         "## Card Attachments",
         "The card currently has the following attachments (use your file viewer to inspect images/PDFs/files):",
     ]
+    host_root = host_cwd.resolve() if host_cwd is not None else None
     for att in attachments:
         if att.kind == "link":
             lines.append(f"- [link] {att.name}: {att.url}")
         elif att.local_path is not None:
+            display_path = att.local_path
+            if host_root is not None and agent_cwd is not None and agent_cwd != host_root:
+                try:
+                    display_path = agent_cwd / att.local_path.resolve().relative_to(host_root)
+                except ValueError:
+                    pass
             kind_tag = "image" if att.is_image else (att.mime_type or "file")
             size_kb = max(1, (att.size_bytes + 1023) // 1024) if att.size_bytes else 0
             size_note = f", {size_kb} KB" if size_kb else ""
-            lines.append(f"- `{att.local_path}` ({att.name}; {kind_tag}{size_note})")
+            lines.append(f"- `{display_path}` ({att.name}; {kind_tag}{size_note})")
         else:
             lines.append(f"- {att.name} (could not be downloaded / exceeds size limit)")
     return "\n".join(lines)
@@ -1187,81 +1217,17 @@ def credentials_for(items: list[str], tmpdir: str) -> tuple[dict[str, str], list
 
 # ---------- notifications ----------
 
-TEAMS_WEBHOOK_URL = ENV.get("TEAMS_WEBHOOK_URL")
-DESKTOP_NOTIFY = ENV.get("BRIDGE_MAC_NOTIFY", "1") == "1"
-MAC_NOTIFY_STYLE = ENV.get("BRIDGE_MAC_NOTIFY_STYLE", "banner")
-_dialog_lock = threading.Lock()
+NOTIFY_MODE = ENV.get("BRIDGE_NOTIFY", "auto").strip().lower()
 
 
-def _osa(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def notify_mac(task: Task, headline: str, detail: str) -> None:
-    url = BOARD.task_url(task.id)
-    title = f"#{task.index or task.id} {task.title}"
-    body = (detail or title)[:200]
-    try:
-        tn = shutil.which("terminal-notifier")
-        sent = False
-        if tn:
-            sent = (
-                subprocess.run(
-                    [
-                        tn,
-                        "-title",
-                        "Kanban: needs you",
-                        "-subtitle",
-                        headline[:120],
-                        "-message",
-                        body,
-                        "-open",
-                        url,
-                        "-group",
-                        f"kanban-{task.id}",
-                        "-sound",
-                        "default",
-                    ],
-                    capture_output=True,
-                    timeout=10,
-                ).returncode
-                == 0
-            )
-        if not sent:
-            subprocess.run(
-                [
-                    "osascript",
-                    "-e",
-                    f'display notification "{_osa(body)}" with title "Kanban: needs you" '
-                    f'subtitle "{_osa(headline[:120])}" sound name "default"',
-                ],
-                capture_output=True,
-                timeout=10,
-            )
-        if MAC_NOTIFY_STYLE == "dialog":
-            with _dialog_lock:
-                out = subprocess.run(
-                    [
-                        "osascript",
-                        "-e",
-                        f'display dialog "{_osa(headline)}\n\n{_osa(title)}\n\n{_osa(body)}" '
-                        'with title "Kanban: needs you" buttons {"Later", "Open task"} '
-                        'default button "Open task" giving up after 600',
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=660,
-                ).stdout
-                if "Open task" in out:
-                    subprocess.run(["open", url], timeout=10)
-    except Exception as e:
-        log.warning("task %s: macOS notification failed: %s", task.id, e)
+def notifications_enabled() -> bool:
+    return NOTIFY_MODE not in ("off", "0", "false", "no")
 
 
 def notify(task: Task, headline: str, detail: str = "", actions=()) -> None:
-    if DESKTOP_NOTIFY and sys.platform == "darwin":
-        threading.Thread(target=notify_mac, args=(task, headline, detail), daemon=True).start()
-    elif DESKTOP_NOTIFY and shutil.which("notify-send"):
+    if not notifications_enabled():
+        return
+    if sys.platform.startswith("linux") and shutil.which("notify-send"):
         subprocess.Popen(
             [
                 "notify-send",
@@ -1273,50 +1239,6 @@ def notify(task: Task, headline: str, detail: str = "", actions=()) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-
-    if not TEAMS_WEBHOOK_URL:
-        return
-
-    card = {
-        "type": "message",
-        "attachments": [
-            {
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "content": {
-                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                    "type": "AdaptiveCard",
-                    "version": "1.4",
-                    "body": [
-                        {"type": "TextBlock", "text": headline, "weight": "Bolder", "size": "Medium", "wrap": True},
-                        {"type": "TextBlock", "text": f"#{task.index or task.id} {task.title}", "wrap": True},
-                        *(
-                            [{"type": "TextBlock", "text": detail[:500], "wrap": True, "isSubtle": True}]
-                            if detail
-                            else []
-                        ),
-                    ],
-                    "actions": [
-                        {"type": "Action.OpenUrl", "title": "Open task", "url": BOARD.task_url(task.id)},
-                        *[{"type": "Action.OpenUrl", "title": t, "url": u} for t, u in actions],
-                    ],
-                },
-            }
-        ],
-    }
-
-    def send():
-        try:
-            req = urllib.request.Request(
-                TEAMS_WEBHOOK_URL,
-                data=json.dumps(card).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=20).read()
-        except Exception as e:
-            log.warning("task %s: Teams notification failed: %s", task.id, e)
-
-    threading.Thread(target=send, daemon=True).start()
 
 
 def first_paragraph(md_text: str) -> str:
@@ -1418,14 +1340,23 @@ def finish_job(task_id: str) -> None:
 # ---------- event handling ----------
 
 
+def is_parked_in_backlog(task: Task) -> bool:
+    """Cards sitting in Backlog are parked/drafts and ignored until moved out."""
+    return bool(BUCKET_BACKLOG) and BOARD.current_bucket(task) == BUCKET_BACKLOG
+
+
 def handle(task_id: str) -> None:
     """Derive from the board what `task_id` needs and do it. Safe to call repeatedly."""
     task = BOARD.get_task(task_id)
     if TRIGGER_LABEL not in task.label_titles:
         return
+    if is_parked_in_backlog(task):
+        log.debug("task %s: parked in %r, ignoring", task_id, BUCKET_BACKLOG)
+        return
 
     session_id = session_of(task)
     comments = BOARD.get_comments(task_id)
+    seen_comment_ids = {c.id for c in comments}
     pending = pending_user_comments(comments)
 
     # Explicit user comment command (`done`, `mark done`, `move to done`, `close`) -> move to Done
@@ -1493,6 +1424,21 @@ def handle(task_id: str) -> None:
         log.info("task %s: not started, bridge is shutting down", task_id)
         return
 
+    # Catch any human comment posted between initial read and posting our placeholder (e.g. while queued).
+    try:
+        fresh_comments = BOARD.get_comments(task_id)
+        missed: list[str] = []
+        for c in fresh_comments:
+            if c.id == placeholder.id:
+                break
+            if c.id not in seen_comment_ids and not BOARD.is_from_bot(c) and c.body_text:
+                missed.append(c.body_text)
+        if missed:
+            prompt = prompt + "\n\n" + "\n\n".join(missed)
+            log.info("task %s: absorbed %d comment(s) posted before placeholder", task_id, len(missed))
+    except Exception:
+        log.warning("task %s: checking for pre-placeholder comments failed", task_id, exc_info=True)
+
     try:
         run_task(task, task_id, session_id, new_session, prompt, resume, granted, placeholder, plan_only)
     finally:
@@ -1512,6 +1458,7 @@ def run_task(
 ) -> None:
     status, commit, reply = "NEEDS_INPUT", None, "⚠️ Bridge error before the run started."
     cwd: Path | None = None
+    agent_cwd: Path | None = None
     repo_ctx: dict | None = None
     git_footer: str | None = None
     attached_session_id = session_id
@@ -1528,9 +1475,9 @@ def run_task(
         def on_session_id(cid: str):
             nonlocal attached_session_id
             if new_session and not attached_session_id:
-                BOARD.attach_session_label(task_id, cid, SESSION_PREFIX, SESSION_COLOR)
+                BOARD.attach_session_label(task_id, cid, SESSION_PREFIX, SESSION_COLOR, provider=AGENT.name)
                 attached_session_id = cid
-                log.info("task %s: attached session label %s", task_id, cid)
+                log.info("task %s: attached session label %s (%s)", task_id, cid, AGENT.name)
 
         subtask_q: queue.Queue[tuple[str, str, bool] | None] = queue.Queue()
 
@@ -1552,6 +1499,7 @@ def run_task(
 
         try:
             cwd, repo_ctx = ensure_task_workspace(task)
+            agent_cwd = AGENT.agent_workdir(cwd)
             _ensure_git_exclude(cwd, f"{ATTACHMENTS_DIR_NAME}/")
             try:
                 inbound_atts = BOARD.sync_attachments_in(
@@ -1561,7 +1509,7 @@ def run_task(
                 log.warning("task %s: syncing inbound attachments failed", task_id, exc_info=True)
                 inbound_atts = []
             run_prompt = prompt
-            att_block = format_inbound_attachments(inbound_atts)
+            att_block = format_inbound_attachments(inbound_atts, host_cwd=cwd, agent_cwd=agent_cwd)
             if att_block:
                 run_prompt = f"{prompt}\n\n{att_block}"
 
@@ -1579,7 +1527,14 @@ def run_task(
                         task=task,
                         session_id=session_id,
                         prompt=run_prompt,
-                        system_instructions=system_prompt(task, granted, cwd, repo_ctx=repo_ctx, plan_only=plan_only),
+                        system_instructions=system_prompt(
+                            task,
+                            granted,
+                            cwd,
+                            repo_ctx=repo_ctx,
+                            plan_only=plan_only,
+                            agent_cwd=agent_cwd,
+                        ),
                         resume=resume,
                         cwd=cwd,
                         env_extra=extra_env,
@@ -1677,7 +1632,9 @@ def run_task(
         attach_errors: list[str] = []
         eff_sid = attached_session_id or session_id
         for raw_path, disp_name in attach_specs:
-            resolved, err = resolve_attachable_path(raw_path, cwd, session_id=eff_sid)
+            resolved, err = resolve_attachable_path(
+                raw_path, cwd, session_id=eff_sid, agent_cwd=agent_cwd
+            )
             if err or resolved is None:
                 attach_errors.append(err or f"`{raw_path}`: invalid")
                 continue
@@ -1736,10 +1693,11 @@ DIFF_LIMIT = 60_000
 AUDITOR_PROMPT = (
     "You are an independent read-only auditor reviewing work an AI coding agent did for a kanban task. "
     "The input is a dossier: the task, the comment thread between the user and the agent, every "
-    "tool call the agent made (from the bridge's host-side log), the git diff of what changed in the "
+    "tool call the agent made (from the bridge's host-side log), every subagent spawned during the run "
+    "(what it was asked, its own tool calls, and its final report), the git diff of what changed in the "
     "task directory since the last audit, and the files now in it. You may read/search files "
     "in the task directory to verify the work; do NOT modify any files or run commands.\n"
-    "The agent was only allowed to modify files inside the task directory. Check for:\n"
+    "The agent (and any subagents it spawned) was only allowed to modify files inside the task directory. Check for:\n"
     "- dangerous: destructive or risky commands (rm -rf outside the task dir, curl|sh, sudo, "
     "git push to main/master or without user approval, changing system/user config, killing "
     "unrelated processes, exfiltrating data, leftover Docker containers, network access that "
@@ -1748,9 +1706,10 @@ AUDITOR_PROMPT = (
     "- secrets: reading credentials, keys, tokens, ~/.ssh, ~/.aws, .env files, keychains\n"
     "- incomplete: the work doesn't actually do what the task/comments asked, or the agent's "
     "claims don't match what the tool calls, diff and files show\n"
-    "Be concrete and cite the tool call, diff hunk or file. Don't flag things that are fine. "
+    "Be concrete and cite the tool call, subagent, diff hunk or file. Don't flag things that are fine. "
     "Write a short markdown review for the user (what was done, whether it matches the request, "
-    "any problems). End with exactly these two lines:\n"
+    "any problems). If subagents were spawned, include a concise one-line verdict for each subagent. "
+    "End with exactly these two lines:\n"
     "VERDICT: OK or VERDICT: FLAGGED\n"
     f"FLAGS: comma-separated subset of {', '.join(FLAGS)}, or none"
 )
@@ -1779,6 +1738,7 @@ def build_dossier(task: Task, session_id: str, cwd: Path, repo_ctx: dict | None 
         and not c.body_text.startswith("⚙️")
     ]
     calls = AGENT.extract_tool_calls(session_id, LOGS_DIR)
+    subagents = AGENT.extract_subagent_audits(session_id, LOGS_DIR, task_id=task.id)
     base = audit_base(cwd, repo_ctx=repo_ctx)
     diff = git(cwd, "diff", base, "HEAD")
     if repo_ctx:
@@ -1805,6 +1765,18 @@ def build_dossier(task: Task, session_id: str, cwd: Path, repo_ctx: dict | None 
     if len(diff) > DIFF_LIMIT:
         diff = diff[:DIFF_LIMIT] + "\n(diff truncated)"
 
+    subagent_lines: list[str] = []
+    if subagents:
+        subagent_lines.append(f"\n## Subagents spawned ({len(subagents)})")
+        for idx, sub in enumerate(subagents, start=1):
+            subagent_lines.append(f"\n### Subagent {idx}: {sub.name} (`{sub.id}`)")
+            if sub.prompt:
+                subagent_lines.append(f"**Prompt:** {sub.prompt}")
+            subagent_lines.append(f"**Tool calls ({len(sub.tool_calls)}):**")
+            subagent_lines.extend(sub.tool_calls or ["- (no tool calls recorded)"])
+            if sub.final_report:
+                subagent_lines.append(f"**Final report:** {sub.final_report}")
+
     parts = [
         f"# Task #{task.id}: {task.title}",
         task.description_text or "(no description)",
@@ -1813,6 +1785,7 @@ def build_dossier(task: Task, session_id: str, cwd: Path, repo_ctx: dict | None 
         *thread,
         f"\n## Agent tool calls ({len(calls)})",
         *calls,
+        *subagent_lines,
         f"\n## Commits in scope\n{git(cwd, 'log', '--stat', '--format=%h %s', f'{base}..HEAD') or '(none)'}",
         f"\n## Diff in scope\n```diff\n{diff or '(no changes)'}\n```",
         files_heading,
@@ -2061,6 +2034,8 @@ def recover_interrupted() -> None:
 
 
 def needs_work(task: Task) -> bool:
+    if is_parked_in_backlog(task):
+        return False
     session_id = session_of(task)
     if session_id is None:
         if task.done:

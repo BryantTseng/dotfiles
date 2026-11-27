@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from providers import AgentProvider, AgentResult, Task
+from providers import AgentProvider, AgentResult, SubagentAudit, Task
 
 log = logging.getLogger("bridge.agy")
 
@@ -559,3 +559,116 @@ class AgyAgent(AgentProvider):
             f"- {calls[k][0]}{' [ERROR/DENIED]' if calls[k][2] else ''}: {calls[k][1]}"
             for k in order
         ]
+
+    def extract_subagent_audits(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> list[SubagentAudit]:
+        log_file = log_dir / f"{session_id}.jsonl"
+        if not log_file.exists():
+            return []
+
+        order: list[str] = []
+        subs: dict[str, dict] = {}
+        for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("event") != "step_update":
+                continue
+            su = ev.get("step_update") or {}
+            if str(su.get("step_type") or "").lower() != "subagent":
+                continue
+            sidx = int(su.get("step_index") or 0)
+            for idx, sub in enumerate((su.get("subagent_info") or {}).get("subagents") or []):
+                cid = str(sub.get("conversation_id") or "")
+                role = str(sub.get("role") or sub.get("type_name") or "subagent").strip()
+                ttype = str(sub.get("type_name") or "").strip()
+                key = cid or f"step:{sidx}:{idx}:{role}"
+                # Upgrade placeholder step key once DONE provides conversation_id
+                step_key = f"step:{sidx}:{idx}:{role}"
+                if cid and step_key in subs and cid not in subs:
+                    subs[cid] = subs.pop(step_key)
+                    order = [cid if k == step_key else k for k in order]
+                if key not in subs:
+                    order.append(key)
+                    subs[key] = {}
+                entry = subs[key]
+                entry["id"] = cid or key
+                entry["role"] = role
+                entry["type_name"] = ttype
+                if sub.get("initial_prompt"):
+                    entry["prompt"] = str(sub["initial_prompt"]).strip()[:2000]
+                if sub.get("log_uri"):
+                    entry["log_uri"] = str(sub["log_uri"])
+
+        audits: list[SubagentAudit] = []
+        for key in order:
+            info = subs[key]
+            role = info.get("role") or "subagent"
+            ttype = info.get("type_name") or ""
+            label = role + (f" ({ttype})" if ttype and ttype.lower() not in role.lower() else "")
+            prompt = info.get("prompt") or ""
+
+            log_uri = info.get("log_uri") or ""
+            transcript_path: Path | None = None
+            if log_uri.startswith("file://"):
+                cand = Path(log_uri[len("file://") :])
+                if cand.is_file():
+                    transcript_path = cand
+            if transcript_path is None and info.get("id") and not str(info["id"]).startswith("step:"):
+                cand = (
+                    Path.home()
+                    / ".gemini"
+                    / "antigravity-cli"
+                    / "brain"
+                    / str(info["id"])
+                    / ".system_generated"
+                    / "logs"
+                    / "transcript.jsonl"
+                )
+                if cand.is_file():
+                    transcript_path = cand
+
+            tool_calls: list[str] = []
+            final_report = ""
+            if transcript_path is not None:
+                steps_raw: list[dict] = []
+                for tline in transcript_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        steps_raw.append(json.loads(tline))
+                    except json.JSONDecodeError:
+                        continue
+                for i, st in enumerate(steps_raw):
+                    if st.get("type") != "PLANNER_RESPONSE":
+                        continue
+                    next_err = (
+                        i + 1 < len(steps_raw)
+                        and str(steps_raw[i + 1].get("status") or "").upper() in ("ERROR", "FAILED", "DENIED")
+                    )
+                    for tc in st.get("tool_calls") or []:
+                        tc_name = str(tc.get("name") or "?")
+                        tc_args = tc.get("args") or {}
+                        args_s = json.dumps(tc_args, ensure_ascii=False)[:800]
+                        tool_calls.append(f"- {tc_name}{' [ERROR/DENIED]' if next_err else ''}: {args_s}")
+                        if tc_name == "send_message" and tc_args.get("Message"):
+                            msg = str(tc_args["Message"]).strip()
+                            if len(msg) >= 2 and msg[0] == '"' and msg[-1] == '"':
+                                try:
+                                    msg = json.loads(msg)
+                                except Exception:
+                                    pass
+                            final_report = str(msg).strip()[:2500]
+                    if st.get("content") and not final_report:
+                        final_report = str(st["content"]).strip()[:2500]
+
+            audits.append(
+                SubagentAudit(
+                    id=str(info.get("id") or key),
+                    name=label[:160],
+                    prompt=prompt,
+                    tool_calls=tool_calls,
+                    final_report=final_report,
+                )
+            )
+        return audits

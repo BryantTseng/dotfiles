@@ -36,6 +36,7 @@ from typing import Callable
 from providers import (
     AgentProvider,
     AgentResult,
+    SubagentAudit,
     Task,
     register_proxy_token,
     unregister_proxy_token,
@@ -568,7 +569,13 @@ class ClaudeAgent(AgentProvider):
         )
         return res.text
 
-    def extract_tool_calls(self, session_id: str, log_dir: Path) -> list[str]:
+    def agent_workdir(self, cwd: Path) -> Path:
+        if self.mode == "docker":
+            workdir, _ = _worktree_git_mount(cwd)
+            return Path(workdir)
+        return cwd
+
+    def _transcript_files(self, session_id: str, log_dir: Path, task_id: str | None = None) -> list[Path]:
         files: list[Path] = []
         primary = log_dir / f"{session_id}.jsonl"
         if primary.exists():
@@ -576,6 +583,28 @@ class ClaudeAgent(AgentProvider):
         host_projects = Path("~/.claude/projects").expanduser()
         if host_projects.is_dir():
             files.extend(host_projects.glob(f"*/{session_id}.jsonl"))
+        if task_id and self.state_root.is_dir():
+            task_proj = self.state_root / f"task-{task_id}" / "projects"
+            if task_proj.is_dir():
+                files.extend(task_proj.glob(f"*/{session_id}.jsonl"))
+        return files
+
+    @staticmethod
+    def _extract_result_text(raw_content) -> str:
+        if isinstance(raw_content, str):
+            return raw_content.strip()
+        if isinstance(raw_content, list):
+            parts: list[str] = []
+            for blk in raw_content:
+                if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text"):
+                    parts.append(str(blk["text"]))
+                elif isinstance(blk, str):
+                    parts.append(blk)
+            return "\n".join(parts).strip()
+        return ""
+
+    def extract_tool_calls(self, session_id: str, log_dir: Path) -> list[str]:
+        files = self._transcript_files(session_id, log_dir)
         if not files:
             return ["(session transcript not found)"]
 
@@ -586,6 +615,9 @@ class ClaudeAgent(AgentProvider):
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                # Tool calls executed inside a child subagent belong under that subagent, not parent.
+                if entry.get("parent_tool_use_id"):
                     continue
                 content = (entry.get("message") or {}).get("content")
                 if not isinstance(content, list):
@@ -615,6 +647,156 @@ class ClaudeAgent(AgentProvider):
             f"- {unique[cid][0]}{' [ERROR/DENIED]' if cid in errors else ''}: {unique[cid][1]}"
             for cid in order
         ]
+
+    def extract_subagent_audits(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> list[SubagentAudit]:
+        files = self._transcript_files(session_id, log_dir, task_id=task_id)
+        if not files:
+            return []
+
+        order: list[str] = []
+        meta: dict[str, tuple[str, str]] = {}  # tool_use_id -> (name, prompt)
+        reports: dict[str, str] = {}
+        child_calls: dict[str, list[tuple[str, str, str]]] = {}
+        child_errors: dict[str, set[str]] = {}
+
+        for f in files:
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = (entry.get("message") or {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                parent_tid = str(entry.get("parent_tool_use_id") or "")
+                if parent_tid:
+                    for item in content:
+                        if item.get("type") == "tool_use":
+                            child_calls.setdefault(parent_tid, []).append(
+                                (
+                                    str(item.get("id") or ""),
+                                    str(item.get("name") or "?"),
+                                    json.dumps(item.get("input") or {}, ensure_ascii=False)[:800],
+                                )
+                            )
+                        elif item.get("type") == "tool_result" and item.get("is_error"):
+                            child_errors.setdefault(parent_tid, set()).add(str(item.get("tool_use_id") or ""))
+                else:
+                    for item in content:
+                        if item.get("type") == "tool_use" and item.get("name") in ("Agent", "Task"):
+                            tid = str(item.get("id") or "")
+                            if not tid:
+                                continue
+                            inp = item.get("input") or {}
+                            desc = str(inp.get("description") or inp.get("subagent_type") or "subagent").strip()
+                            stype = str(inp.get("subagent_type") or "").strip()
+                            label = desc + (f" ({stype})" if stype and stype.lower() not in desc.lower() else "")
+                            prompt = str(inp.get("prompt") or desc).strip()[:2000]
+                            if tid not in meta:
+                                order.append(tid)
+                            meta[tid] = (label[:160], prompt)
+                        elif item.get("type") == "tool_result":
+                            tid = str(item.get("tool_use_id") or "")
+                            if tid in meta:
+                                txt = self._extract_result_text(item.get("content"))
+                                if txt:
+                                    reports[tid] = txt[:2500]
+
+        # Also check on-disk Claude subagent JSONL files (Docker state_root or host ~/.claude)
+        # when child tool calls weren't streamed with parent_tool_use_id.
+        sub_dirs: list[Path] = []
+        for base in [Path("~/.claude/projects").expanduser(), *(
+            [self.state_root / f"task-{task_id}" / "projects"] if task_id else []
+        )]:
+            if base.is_dir():
+                sub_dirs.extend(base.glob(f"*/{session_id}/subagents"))
+                sub_dirs.extend(base.glob("*/subagents"))
+        seen_subfiles: set[Path] = set()
+        for sdir in sub_dirs:
+            for sf in sorted(sdir.glob("agent-*.jsonl")):
+                rpath = sf.resolve()
+                if rpath in seen_subfiles:
+                    continue
+                seen_subfiles.add(rpath)
+                sid_key = f"file:{sf.stem}"
+                s_calls: list[tuple[str, str, str]] = []
+                s_errs: set[str] = set()
+                s_prompt = ""
+                s_report = ""
+                for line in sf.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = entry.get("message") or {}
+                    role = msg.get("role") or entry.get("type")
+                    content = msg.get("content")
+                    if role == "user" and not s_prompt:
+                        s_prompt = self._extract_result_text(content)[:2000]
+                    if isinstance(content, list):
+                        for item in content:
+                            if item.get("type") == "tool_use":
+                                s_calls.append(
+                                    (
+                                        str(item.get("id") or ""),
+                                        str(item.get("name") or "?"),
+                                        json.dumps(item.get("input") or {}, ensure_ascii=False)[:800],
+                                    )
+                                )
+                            elif item.get("type") == "tool_result" and item.get("is_error"):
+                                s_errs.add(str(item.get("tool_use_id") or ""))
+                            elif role == "assistant" and item.get("type") == "text" and item.get("text"):
+                                s_report = str(item["text"]).strip()[:2500]
+                    elif role == "assistant" and isinstance(content, str) and content.strip():
+                        s_report = content.strip()[:2500]
+
+                # Match to an existing parent Agent/Task call without child_calls if prompts align
+                matched_tid = None
+                for tid in order:
+                    if not child_calls.get(tid) and s_prompt and meta[tid][1] and (
+                        s_prompt[:120] in meta[tid][1] or meta[tid][1][:120] in s_prompt
+                    ):
+                        matched_tid = tid
+                        break
+                if matched_tid:
+                    child_calls[matched_tid] = s_calls
+                    child_errors[matched_tid] = s_errs
+                    if s_report and not reports.get(matched_tid):
+                        reports[matched_tid] = s_report
+                elif s_calls or s_report:
+                    order.append(sid_key)
+                    meta[sid_key] = (sf.stem, s_prompt)
+                    child_calls[sid_key] = s_calls
+                    child_errors[sid_key] = s_errs
+                    if s_report:
+                        reports[sid_key] = s_report
+
+        audits: list[SubagentAudit] = []
+        for tid in order:
+            name, prompt = meta[tid]
+            errs = child_errors.get(tid, set())
+            unique_c: dict[str, tuple[str, str]] = {}
+            c_order: list[str] = []
+            for cid, cname, cinp in child_calls.get(tid, []):
+                if cid not in unique_c:
+                    c_order.append(cid)
+                unique_c[cid] = (cname, cinp)
+            formatted_calls = [
+                f"- {unique_c[cid][0]}{' [ERROR/DENIED]' if cid in errs else ''}: {unique_c[cid][1]}"
+                for cid in c_order
+            ]
+            audits.append(
+                SubagentAudit(
+                    id=tid,
+                    name=name,
+                    prompt=prompt,
+                    tool_calls=formatted_calls,
+                    final_report=reports.get(tid, ""),
+                )
+            )
+        return audits
 
     def force_cleanup(self) -> None:
         if self.mode != "docker":
