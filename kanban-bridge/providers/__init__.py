@@ -16,7 +16,30 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+import threading
 from typing import Callable
+
+# Thread-safe registry of ephemeral per-run auth-proxy tokens (used by containerized providers
+# like ClaudeAgent so the real OAuth token never enters a container).
+_proxy_tokens: dict[str, str] = {}
+_proxy_tokens_lock = threading.Lock()
+
+
+def register_proxy_token(token: str, task_id: str) -> None:
+    with _proxy_tokens_lock:
+        _proxy_tokens[token] = task_id
+
+
+def unregister_proxy_token(token: str) -> None:
+    with _proxy_tokens_lock:
+        _proxy_tokens.pop(token, None)
+
+
+def is_valid_proxy_token(token: str) -> bool:
+    if not token:
+        return False
+    with _proxy_tokens_lock:
+        return token in _proxy_tokens
 
 
 @dataclass
@@ -205,4 +228,8 @@ def load_agent_provider(name: str, env: dict[str, str]) -> AgentProvider:
         from providers.agy import AgyAgent
 
         return AgyAgent.from_env(env)
-    raise ValueError(f"Unknown agent provider {name!r}. Supported: agy")
+    if key == "claude":
+        from providers.claude import ClaudeAgent
+
+        return ClaudeAgent.from_env(env)
+    raise ValueError(f"Unknown agent provider {name!r}. Supported: agy, claude")

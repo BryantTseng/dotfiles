@@ -28,7 +28,7 @@ from providers import BoardProvider, Comment, Label, Task, WebhookEvent
 log = logging.getLogger("bridge.planka")
 
 PLANKA_EVENTS = ["cardCreate", "cardUpdate", "cardLabelCreate", "cardLabelDelete", "commentCreate"]
-SESSION_TAG_RE = re.compile(r"\n*<!--\s*agy-session:([A-Za-z0-9._-]+)\s*-->\s*$")
+SESSION_TAG_RE = re.compile(r"\n*<!--\s*(?:agy|claude|kanban)-session:([A-Za-z0-9._-]+)\s*-->\s*$")
 
 # Map bridge hex colors to Planka v2 Label.COLORS
 HEX_TO_PLANKA_COLOR = {

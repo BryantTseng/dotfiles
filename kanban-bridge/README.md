@@ -1,6 +1,6 @@
-# Kanban Bridge (Planka v2 ↔ Headless `agy`)
+# Kanban Bridge (Planka v2 ↔ Headless `agy` / `claude`)
 
-A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`** sessions, with pluggable `BoardProvider` and `AgentProvider` interfaces so you can swap boards (e.g. Trello, Linear) or agent runtimes (e.g. Claude Code) without touching the orchestrator.
+A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`** or **Claude Code (`claude`)** sessions, with pluggable `BoardProvider` and `AgentProvider` interfaces so you can swap boards (e.g. Trello, Linear) or agent runtimes (`agy` ↔ `claude`) without touching the orchestrator.
 
 ---
 
@@ -40,14 +40,19 @@ kanban-bridge/
 ├── AGENTS.md                 # Operational guardrails (symlinked as CLAUDE.md & GEMINI.md)
 ├── bridge.py                 # Core orchestrator (uv PEP 723 script)
 ├── providers/
-│   ├── __init__.py           # Pluggable BoardProvider & AgentProvider ABCs + loader
+│   ├── __init__.py           # Pluggable BoardProvider & AgentProvider ABCs + proxy token registry
 │   ├── planka.py             # Planka v2 provider (WebSockets, X-Api-Key, webhooks)
-│   └── agy.py                # Host `agy --sandbox` provider + read-only auditor
+│   ├── agy.py                # Host `agy --sandbox` provider + read-only auditor
+│   └── claude.py             # Claude Code provider (Docker+auth-proxy or host mode) + auditor
+├── agent/
+│   └── Dockerfile            # Isolated container image for Claude Code (`kanban-agent:latest`)
 ├── planka/
 │   ├── docker-compose.yml    # Planka v2 + PostgreSQL 16 (localhost-only, --net=host)
 │   └── setup-planka.sh       # Interactive one-time setup (API keys, bot user, board & lists)
+├── tests/
+│   └── test_providers.py     # Fast isolated unit tests for providers and auth proxy
 ├── kanban-bridge.service     # systemd user service unit
-├── run.sh                    # Standalone foreground runner (alternative to systemd)
+├── run.sh                    # Standalone runner (alternative to systemd)
 ├── env.example               # Template for ~/.config/kanban-bridge/env (no secrets)
 └── install.sh                # Fresh-machine bootstrap script
 ```
@@ -119,6 +124,46 @@ State lives in four places:
 2. **Planka uploaded files:** Docker volumes `planka_attachments`, `planka_avatars`, `planka_backgrounds`, `planka_favicons`.
 3. **Task git repos & host audit logs:** `~/workspace/kanban-tasks/` and `~/.local/share/kanban-bridge/logs/`.
 4. **Secrets (back up encrypted only, e.g. `restic`/`borg`):** `~/.config/kanban-bridge/`.
+
+---
+
+## Using Claude Code (`BRIDGE_AGENT_PROVIDER=claude`)
+
+You can run the exact same Planka board, `/setup` intake, `plan-first` gate, git worktrees, and manual auditing with **Claude Code** instead of `agy`:
+
+### Option A — Isolated Docker Containers + Auth Proxy *(default)*
+Containers never see your real `CLAUDE_OAUTH_TOKEN`; each run receives a per-run secret valid only at the bridge's local proxy (`:8788`), which swaps in the real token upstream.
+
+1. **Build the agent image:**
+   ```bash
+   docker build -t kanban-agent:latest ~/workspace/kanban-bridge/agent/
+   docker run --rm kanban-agent:latest sh -c 'claude --version; gh --version; aws --version; az version'
+   ```
+2. **Generate a Claude OAuth token** in your own terminal (`claude setup-token`) and add to `~/.config/kanban-bridge/env`:
+   ```bash
+   BRIDGE_AGENT_PROVIDER=claude
+   BRIDGE_CLAUDE_MODE=docker
+   CLAUDE_OAUTH_TOKEN=<token-from-claude-setup-token>
+   # Optional: rename trigger/bot from agy -> claude (run setup-planka.sh with BOT_USERNAME=claude)
+   # BRIDGE_TRIGGER_LABEL=claude
+   # BOT_USERNAME=claude
+   # On Linux rootless Docker so container-created files stay owned by your host UID:
+   # BRIDGE_DOCKER_NET=host
+   # BRIDGE_DOCKER_USER=0:0
+   ```
+3. **Restart the bridge:**
+   ```bash
+   systemctl --user restart kanban-bridge.service
+   curl -sf http://127.0.0.1:8787/health   # -> {"ok": true, "board": "planka", "agent": "claude"}
+   ```
+
+### Option B — Host Claude CLI (`BRIDGE_CLAUDE_MODE=host`)
+Skip Docker and the auth proxy when cards need local toolchains (e.g. Rust/Cargo or rootless Docker integration tests):
+```bash
+BRIDGE_AGENT_PROVIDER=claude
+BRIDGE_CLAUDE_MODE=host
+```
+Uses your local `claude` CLI login directly in `cwd` (stripping all bridge secrets from the child environment).
 
 ---
 

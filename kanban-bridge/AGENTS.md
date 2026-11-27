@@ -15,10 +15,12 @@ Operational notes for AI agents (`agy`, `claudecode`, etc.) working in this repo
 - **Audit trigger:** Audits run **only** when the user explicitly moves a card into **Auditing** (diffs against `merge-base origin/main HEAD` for repo-backed cards). Finished runs (`STATUS: DONE`) move straight to **Done**.
 
 ## Architecture
-- `bridge.py`: Core orchestrator (queueing, 2-slot cap, git commits, access flow, notifications, graceful/forced shutdown, auto-reload via exit code `3`).
-- `providers/__init__.py`: `BoardProvider` and `AgentProvider` interfaces + loader.
+- `bridge.py`: Core orchestrator (queueing, 2-slot cap, `/setup` intake, `plan-first` gate, git worktrees, access flow, notifications, auth proxy, graceful/forced shutdown, auto-reload via exit code `3`).
+- `providers/__init__.py`: `BoardProvider` and `AgentProvider` interfaces, loader (`planka`, `agy`, `claude`), and proxy token registry.
 - `providers/planka.py`: Planka v2 backend (live WebSocket UI, `X-Api-Key`, `viewer+canComment` bot user, invisible description session tag, webhooks).
 - `providers/agy.py`: Host `agy --sandbox` backend (`stream-json`, immediate session capture, host audit log, read-only `--mode plan` auditor).
+- `providers/claude.py`: Claude Code backend (isolated `kanban-agent:latest` Docker containers + `:8788` OAuth proxy, or `BRIDGE_CLAUDE_MODE=host`, plus host read-only `--allowedTools Read,Grep,Glob` auditor).
+- `agent/Dockerfile`: Debian bookworm-slim image for containerized Claude Code runs (`claude`, `gh`, `aws`, `az`, `uv`, `git`, `ripgrep`, `nodejs`).
 
 ## Running & Checking
 - Systemd user unit: `~/.config/systemd/user/kanban-bridge.service` (source: `kanban-bridge.service`).

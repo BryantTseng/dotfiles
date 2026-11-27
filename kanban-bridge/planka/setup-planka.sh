@@ -9,12 +9,16 @@ set -euo pipefail
 
 PLANKA_URL="${PLANKA_URL:-http://localhost:3000}"
 ENV_FILE="${HOME}/.config/kanban-bridge/env"
+BOT_USERNAME="${BOT_USERNAME:-agy}"
+TRIGGER_LABEL="${BRIDGE_TRIGGER_LABEL:-$BOT_USERNAME}"
+BOARD_TITLE="${PLANKA_BOARD_NAME:-$(printf '%s' "$BOT_USERNAME" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')}"
 
 read -rp "Planka admin email or username: " PLANKA_USER
 read -rsp "Planka admin password: " PLANKA_PASS
 echo ""
 
 PLANKA_USER="$PLANKA_USER" PLANKA_PASS="$PLANKA_PASS" PLANKA_URL="$PLANKA_URL" ENV_FILE="$ENV_FILE" \
+BOT_USERNAME="$BOT_USERNAME" TRIGGER_LABEL="$TRIGGER_LABEL" BOARD_TITLE="$BOARD_TITLE" \
 python3 - <<'PY'
 import json
 import os
@@ -60,38 +64,42 @@ my_id = str(me["id"])
 # 2. Mint admin API key
 admin_key = api("POST", f"/users/{my_id}/api-key", bearer=tok)["included"]["apiKey"]
 
-# 3. Create or reuse bot user "agy" and mint its API key
+# 3. Create or reuse bot user and mint its API key
+BOT_USER = os.environ["BOT_USERNAME"]
+TRIGGER = os.environ["TRIGGER_LABEL"]
+BOARD_TITLE = os.environ["BOARD_TITLE"]
+
 users = (api("GET", "/users", api_key=admin_key) or {}).get("items") or []
-bot = next((u for u in users if u.get("username") == "agy"), None)
+bot = next((u for u in users if u.get("username") == BOT_USER), None)
 if not bot:
-    pw = "AgyBot!" + secrets.token_hex(12) + "9aZ"
+    pw = "KanbanBot!" + secrets.token_hex(12) + "9aZ"
     bot = api("POST", "/users", {
-        "email": "agy@kanban.local",
+        "email": f"{BOT_USER}@kanban.local",
         "password": pw,
         "role": "boardUser",
-        "name": "Agy",
-        "username": "agy",
+        "name": BOARD_TITLE,
+        "username": BOT_USER,
     }, api_key=admin_key)["item"]
 bot_id = str(bot["id"])
 bot_key = api("POST", f"/users/{bot_id}/api-key", api_key=admin_key)["included"]["apiKey"]
 
-# 4. Create Project "Agy", Board "Agy", 7 lists, and "agy" trigger label
+# 4. Create Project, Board, 7 lists, and trigger/mode labels
 proj_bundle = api("GET", "/projects", api_key=admin_key) or {}
-proj = next((p for p in (proj_bundle.get("items") or []) if p.get("name") == "Agy"), None)
+proj = next((p for p in (proj_bundle.get("items") or []) if p.get("name") == BOARD_TITLE), None)
 if not proj:
     proj = api("POST", "/projects", {
         "type": "shared",
-        "name": "Agy",
-        "description": "Kanban board for Agy agent tasks",
+        "name": BOARD_TITLE,
+        "description": f"Kanban board for {BOARD_TITLE} agent tasks",
     }, api_key=admin_key)["item"]
 pid = str(proj["id"])
 
 proj_bundle = api("GET", "/projects", api_key=admin_key) or {}
 boards = [b for b in ((proj_bundle.get("included") or {}).get("boards") or []) if str(b.get("projectId")) == pid]
-board = next((b for b in boards if b.get("name") == "Agy"), None)
+board = next((b for b in boards if b.get("name") == BOARD_TITLE), None)
 if not board:
     board = api("POST", f"/projects/{pid}/boards", {
-        "name": "Agy",
+        "name": BOARD_TITLE,
         "position": 65536,
     }, api_key=admin_key)["item"]
 bid = str(board["id"])
@@ -125,7 +133,7 @@ for idx, (name, ltype) in enumerate(desired, start=1):
 
 existing_labels = {l.get("name"): l for l in (inc.get("labels") or []) if l.get("name")}
 default_labels = [
-    ("agy", "lagoon-blue"),
+    (TRIGGER, "lagoon-blue"),
     ("plan-first", "egg-yellow"),
     ("direct", "sunny-grass"),
     ("worktree", "lagoon-blue"),

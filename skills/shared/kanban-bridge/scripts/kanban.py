@@ -20,7 +20,7 @@ import urllib.request
 from pathlib import Path
 
 ENV_PATH = Path.home() / ".config/kanban-bridge/env"
-SESSION_TAG_RE = re.compile(r"\n*<!--\s*agy-session:([A-Za-z0-9._-]+)\s*-->\s*$")
+SESSION_TAG_RE = re.compile(r"\n*<!--\s*(?:agy|claude|kanban)-session:([A-Za-z0-9._-]+)\s*-->\s*$")
 APPROVE_RE = re.compile(r"^\s*(approve|deny)\b", re.I)
 
 
