@@ -738,6 +738,53 @@ class AgyAgent(AgentProvider):
             u.cache_read_tokens += int(st.get("cache_read_tokens") or 0)
         return by_model
 
+    @classmethod
+    def _discover_child_agents_in_transcript(cls, tpath: Path) -> list[tuple[str, str, Path]]:
+        """Discover spawned subagents and swarm workers referenced inside a `transcript.jsonl`.
+
+        Returns `[(conversation_id, display_name, transcript_path), ...]`.
+        """
+        found: list[tuple[str, str, Path]] = []
+        text = tpath.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            if "logAbsoluteUri" in line:
+                for uri_m in re.finditer(r'file://([^"\\\s]+transcript\.jsonl)', line):
+                    cand = Path(uri_m.group(1))
+                    if cand.is_file():
+                        # Try to pull conversation_id from brain/<cid>/.system_generated/...
+                        cid = cand.parents[2].name if len(cand.parents) >= 3 else cand.stem
+                        found.append((cid, f"subagent {cid[:8]}", cand))
+            if '"status":"added"' in line or '\\"status\\":\\"added\\"' in line:
+                try:
+                    st = json.loads(line)
+                    content = str(st.get("content") or "")
+                except json.JSONDecodeError:
+                    content = line
+                for chunk in content.splitlines():
+                    chunk = chunk.strip()
+                    if not chunk.startswith("{"):
+                        continue
+                    try:
+                        obj = json.loads(chunk)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("status") != "added":
+                        continue
+                    workers = obj.get("workers") if isinstance(obj.get("workers"), list) else [obj]
+                    for w in workers:
+                        if not isinstance(w, dict):
+                            continue
+                        cid = str(w.get("conversation_id") or "").strip()
+                        if not cid:
+                            continue
+                        cand = cls._transcript_path(cid)
+                        if cand is not None:
+                            wname = str(w.get("name") or cid[:8]).strip()
+                            wmodel = str(w.get("model") or "").strip()
+                            label = f"[swarm] {wname}" + (f" ({wmodel})" if wmodel else "")
+                            found.append((cid, label, cand))
+        return found
+
     def extract_usage_summary(
         self, session_id: str, log_dir: Path, task_id: str | None = None
     ) -> UsageSummary:
@@ -749,6 +796,14 @@ class AgyAgent(AgentProvider):
         log_file = log_dir / f"{session_id}.jsonl"
         sub_paths: list[Path] = []
         seen_sub_paths: set[Path] = set()
+        if tpath is not None:
+            seen_sub_paths.add(tpath.resolve())
+            for _, _, cand in self._discover_child_agents_in_transcript(tpath):
+                r = cand.resolve()
+                if r not in seen_sub_paths:
+                    seen_sub_paths.add(r)
+                    sub_paths.append(r)
+
         if log_file.exists():
             last_result_usage: dict | None = None
             for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -777,6 +832,15 @@ class AgyAgent(AgentProvider):
                                 if r not in seen_sub_paths:
                                     seen_sub_paths.add(r)
                                     sub_paths.append(r)
+                    elif str(su.get("tool_name") or "") == "swarm":
+                        out_text = str((su.get("tool_info") or {}).get("output") or "")
+                        for cid_m in re.finditer(r'"conversation_id"\s*:\s*"([A-Za-z0-9._-]+)"', out_text):
+                            cand = self._transcript_path(cid_m.group(1))
+                            if cand is not None:
+                                r = cand.resolve()
+                                if r not in seen_sub_paths:
+                                    seen_sub_paths.add(r)
+                                    sub_paths.append(r)
 
             if not parent_by_model and last_result_usage:
                 m = self.model or "agy"
@@ -787,7 +851,7 @@ class AgyAgent(AgentProvider):
                     cache_read_tokens=int(last_result_usage.get("cache_read_tokens") or 0),
                 )
 
-        # Recursively discover any nested grandchild subagents referenced inside child transcripts.
+        # Recursively discover any nested grandchild subagents or swarm helper workers.
         sub_by_model: dict[str, ModelUsage] = {}
         queue_paths = list(sub_paths)
         while queue_paths:
@@ -797,16 +861,11 @@ class AgyAgent(AgentProvider):
                 dst.input_tokens += u.input_tokens
                 dst.output_tokens += u.output_tokens
                 dst.cache_read_tokens += u.cache_read_tokens
-            for line in sp.read_text(encoding="utf-8", errors="replace").splitlines():
-                if "logAbsoluteUri" not in line:
-                    continue
-                for uri_m in re.finditer(r'file://([^"\\\s]+transcript\.jsonl)', line):
-                    cand = Path(uri_m.group(1))
-                    if cand.is_file():
-                        r = cand.resolve()
-                        if r not in seen_sub_paths and (tpath is None or r != tpath.resolve()):
-                            seen_sub_paths.add(r)
-                            queue_paths.append(r)
+            for _, _, cand in self._discover_child_agents_in_transcript(sp):
+                r = cand.resolve()
+                if r not in seen_sub_paths:
+                    seen_sub_paths.add(r)
+                    queue_paths.append(r)
 
         models = list(parent_by_model.values())
         sub_models = list(sub_by_model.values())

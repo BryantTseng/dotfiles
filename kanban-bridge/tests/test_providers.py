@@ -1146,6 +1146,75 @@ class TestCrossPlatformWorkdirBacklogAndSubagentAudits(unittest.TestCase):
             )
             self.assertAlmostEqual(c5 or 0.0, 3.0, places=6)
 
+    def test_agy_swarm_worker_cost_rollup_from_transcript(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coord_t = root / "coord.jsonl"
+            worker_t = root / "worker.jsonl"
+            worker_t.write_text(
+                json.dumps(
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "model": "gemini-4-hydrogen-medium",
+                        "input_tokens": 20000,
+                        "cache_read_tokens": 40000,
+                        "output_tokens": 2000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            coord_t.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "model": "gemini-4-neon-high",
+                                "input_tokens": 10000,
+                                "cache_read_tokens": 0,
+                                "output_tokens": 500,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "GENERIC",
+                                "content": 'Created At: ...\n{"status":"added","name":"dev","model":"gemini-4-hydrogen-medium","conversation_id":"worker-cid-1"}',
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_tpath(cid):
+                return {"coord-cid": coord_t, "worker-cid-1": worker_t}.get(cid)
+
+            agent = AgyAgent(
+                agy_bin=sys.executable,
+                base_env={
+                    "BRIDGE_STATE_ROOT": str(root),
+                    "BRIDGE_PRICING_URL": "",
+                    "BRIDGE_MODEL_PRICING": json.dumps(
+                        {
+                            "gemini-4-neon": [3.0, 15.0, 0.15, 0.0],
+                            "gemini-4-hydrogen": [1.5, 7.5, 0.075, 0.0],
+                        }
+                    ),
+                },
+            )
+            with mock.patch.object(AgyAgent, "_transcript_path", side_effect=fake_tpath):
+                summary = agent.extract_usage_summary("coord-cid", root)
+
+            self.assertEqual([u.model for u in summary.models], ["gemini-4-neon-high"])
+            self.assertEqual([u.model for u in summary.subagent_models], ["gemini-4-hydrogen-medium"])
+            self.assertEqual(summary.subagent_models[0].input_tokens, 20000)
+            self.assertEqual(summary.subagent_models[0].cache_read_tokens, 40000)
+            self.assertIsNotNone(summary.estimated_cost_usd)
+            # coord: 10k*3/1M + 500*15/1M = 0.0375; worker: 20k*1.5/1M + 40k*0.075/1M + 2k*7.5/1M = 0.048 => 0.0855
+            self.assertAlmostEqual(summary.estimated_cost_usd or 0.0, 0.0855, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
