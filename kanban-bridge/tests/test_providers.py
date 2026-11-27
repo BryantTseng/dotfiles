@@ -341,29 +341,62 @@ class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
             self.assertEqual(res.text, "Implemented the Rust notifier.\nSTATUS: DONE")
 
     def test_agy_live_subtask_sync_on_success_and_error(self):
-        def _step(idx: int, name: str, state: str, params: dict, output: str = "") -> dict:
-            return {
-                "event": "step_update",
-                "step_update": {
-                    "conversation_id": "conv-sub",
-                    "step_index": idx,
-                    "state": state,
-                    "step_type": "tool",
-                    "tool_name": name,
-                    "tool_info": {"name": name, "parameters": params, "output": output},
-                },
+        def _step(
+            idx: int,
+            name: str,
+            state: str,
+            params: dict | None = None,
+            output: str = "",
+            step_type: str = "tool",
+            duration: float | None = None,
+            subagent_info: dict | None = None,
+        ) -> dict:
+            su: dict = {
+                "conversation_id": "conv-sub",
+                "step_index": idx,
+                "state": state,
+                "step_type": step_type,
+                "tool_name": name,
             }
+            if params is not None or output:
+                su["tool_info"] = {"name": name, "parameters": params or {}, "output": output}
+            if duration is not None:
+                su["duration_seconds"] = duration
+            if subagent_info is not None:
+                su["subagent_info"] = subagent_info
+            return {"event": "step_update", "step_update": su}
 
         base_events = [
             {"event": "init", "conversation_id": "conv-sub"},
-            _step(1, "invoke_subagent", "ACTIVE", {"Role": "Codebase Researcher", "TypeName": "research"}),
-            _step(2, "invoke_subagent", "ACTIVE", {"Role": "API Auditor", "TypeName": "self"}),
-            _step(3, "swarm", "ACTIVE", {"action": "add", "name": "dev", "model": "medium", "n": 2}),
-            _step(4, "swarm", "ACTIVE", {"action": "kill", "name": "dev-1"}),
-            _step(5, "run_workflow", "ACTIVE", {"Description": "Fan out lint checks"}),
-            _step(5, "run_workflow", "DONE", {"Description": "Fan out lint checks"}, output="All checks passed"),
+            # Real agy stream-json schema for invoke_subagent: step_type="subagent" + subagent_info
             _step(
-                6,
+                1,
+                "invoke_subagent",
+                "ACTIVE",
+                step_type="subagent",
+                subagent_info={
+                    "subagents": [
+                        {"type_name": "research", "role": "Codebase Researcher"},
+                        {"type_name": "self", "role": "API Auditor"},
+                    ]
+                },
+            ),
+            _step(2, "swarm", "ACTIVE", {"action": "add", "name": "dev", "model": "medium", "n": 2}),
+            _step(3, "swarm", "ACTIVE", {"action": "kill", "name": "dev-1"}),
+            _step(4, "run_workflow", "ACTIVE", {"Description": "Fan out lint checks"}),
+            _step(4, "run_workflow", "DONE", {"Description": "Fan out lint checks"}, output="All checks passed"),
+            # Fast command (<2s): should NOT appear in checklist
+            _step(5, "run_command", "ACTIVE", {"CommandLine": "git status"}),
+            _step(5, "run_command", "DONE", {"CommandLine": "git status"}, output="Command exited with code 0.", duration=0.3),
+            # Long/backgrounded command (>=2s, exit 0): appears and marks checked
+            _step(6, "run_command", "ACTIVE", {"CommandLine": "sleep 2 && echo bg-ok"}),
+            _step(6, "run_command", "DONE", {"CommandLine": "sleep 2 && echo bg-ok"}, output="Command exited with code 0.\nbg-ok", duration=4.28),
+            # Failed long command (exit 101): stays unchecked even on SUCCESS
+            _step(7, "run_command", "ACTIVE", {"CommandLine": "cargo test --broken"}),
+            _step(7, "run_command", "DONE", {"CommandLine": "cargo test --broken"}, output="Command exited with code 101.", duration=12.5),
+            # Explicit background task output
+            _step(
+                8,
                 "run_command",
                 "DONE",
                 {"toolSummary": "Cargo test build", "CommandLine": "cargo test"},
@@ -375,7 +408,7 @@ class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
             tmp_path = Path(tmp)
             agent = AgyAgent(agy_bin=sys.executable, base_env={})
 
-            # 1) Clean SUCCESS auto-completes remaining open subtasks
+            # 1) Clean SUCCESS auto-completes remaining non-failed subtasks
             ok_events = base_events + [
                 {"event": "result", "result": {"conversation_id": "conv-sub", "status": "SUCCESS", "response": "Done"}}
             ]
@@ -401,11 +434,13 @@ class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
                     ("Subagents & Tasks", "[swarm] dev-1 (medium)", True),
                     ("Subagents & Tasks", "[workflow] Fan out lint checks", False),
                     ("Subagents & Tasks", "[workflow] Fan out lint checks", True),
-                    ("Subagents & Tasks", "[bg] Cargo test build", False),
+                    ("Subagents & Tasks", "[cmd] sleep 2 && echo bg-ok", True),
+                    ("Subagents & Tasks", "[cmd] cargo test --broken", False),
+                    ("Subagents & Tasks", "[cmd] Cargo test build", False),
                     ("Subagents & Tasks", "[subagent] Codebase Researcher", True),
                     ("Subagents & Tasks", "[subagent] API Auditor (self)", True),
                     ("Subagents & Tasks", "[swarm] dev-2 (medium)", True),
-                    ("Subagents & Tasks", "[bg] Cargo test build", True),
+                    ("Subagents & Tasks", "[cmd] Cargo test build", True),
                 ],
             )
 
@@ -435,7 +470,9 @@ class TestAgyFinalResponseAndBridgeParsers(unittest.TestCase):
                     ("Subagents & Tasks", "[swarm] dev-1 (medium)", True),
                     ("Subagents & Tasks", "[workflow] Fan out lint checks", False),
                     ("Subagents & Tasks", "[workflow] Fan out lint checks", True),
-                    ("Subagents & Tasks", "[bg] Cargo test build", False),
+                    ("Subagents & Tasks", "[cmd] sleep 2 && echo bg-ok", True),
+                    ("Subagents & Tasks", "[cmd] cargo test --broken", False),
+                    ("Subagents & Tasks", "[cmd] Cargo test build", False),
                 ],
             )
 
