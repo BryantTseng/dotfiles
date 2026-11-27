@@ -28,7 +28,15 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from providers import AgentProvider, AgentResult, SubagentAudit, Task
+from providers import (
+    AgentProvider,
+    AgentResult,
+    ModelUsage,
+    SubagentAudit,
+    Task,
+    UsageSummary,
+    estimate_model_cost_usd,
+)
 
 log = logging.getLogger("bridge.agy")
 
@@ -376,6 +384,8 @@ class AgyAgent(AgentProvider):
             if timed_out.is_set():
                 raise subprocess.TimeoutExpired(cmd, timeout)
 
+            detected_model = self._detect_model(session_id) or self.model
+
             if result_payload is None:
                 err.seek(0)
                 stderr_tail = err.read()[-2000:].strip()
@@ -383,6 +393,7 @@ class AgyAgent(AgentProvider):
                     text=f"⚠️ Agy failed (exit {p.returncode}):\n\n```\n{stderr_tail}\n```",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
 
             status = str(result_payload.get("status") or "SUCCESS").upper()
@@ -405,6 +416,7 @@ class AgyAgent(AgentProvider):
                     text=f"⚠️ Agy ended with status `{status}`:\n\n{detail}",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
             if denied and not text:
                 names = ", ".join(d.get("display_name") or d.get("action") or "?" for d in denied)
@@ -412,8 +424,14 @@ class AgyAgent(AgentProvider):
                     text=f"⚠️ Agy could not proceed because headless permissions denied: {names}.",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
-            return AgentResult(text=text or "(no output)", session_id=session_id, is_error=False)
+            return AgentResult(
+                text=text or "(no output)",
+                session_id=session_id,
+                is_error=False,
+                model=detected_model,
+            )
 
     def run_task(
         self,
@@ -672,3 +690,119 @@ class AgyAgent(AgentProvider):
                 )
             )
         return audits
+
+    @staticmethod
+    def _transcript_path(session_id: str | None) -> Path | None:
+        if not session_id:
+            return None
+        cand = (
+            Path.home()
+            / ".gemini"
+            / "antigravity-cli"
+            / "brain"
+            / session_id
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
+        return cand if cand.is_file() else None
+
+    def _detect_model(self, session_id: str | None) -> str | None:
+        tpath = self._transcript_path(session_id)
+        if tpath is None:
+            return None
+        last_model: str | None = None
+        for line in tpath.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                st = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if st.get("type") == "PLANNER_RESPONSE" and st.get("model"):
+                last_model = str(st["model"]).strip()
+        return last_model
+
+    @staticmethod
+    def _usage_from_transcript(tpath: Path) -> dict[str, ModelUsage]:
+        by_model: dict[str, ModelUsage] = {}
+        for line in tpath.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                st = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if st.get("type") != "PLANNER_RESPONSE":
+                continue
+            m = str(st.get("model") or "agy").strip() or "agy"
+            u = by_model.setdefault(m, ModelUsage(model=m))
+            u.input_tokens += int(st.get("input_tokens") or 0)
+            u.output_tokens += int(st.get("output_tokens") or 0)
+            u.cache_read_tokens += int(st.get("cache_read_tokens") or 0)
+        return by_model
+
+    def extract_usage_summary(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> UsageSummary:
+        parent_by_model: dict[str, ModelUsage] = {}
+        tpath = self._transcript_path(session_id)
+        if tpath is not None:
+            parent_by_model = self._usage_from_transcript(tpath)
+
+        log_file = log_dir / f"{session_id}.jsonl"
+        sub_paths: list[Path] = []
+        seen_sub_paths: set[Path] = set()
+        if log_file.exists():
+            last_result_usage: dict | None = None
+            for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("event") == "result":
+                    usage = (ev.get("result") or ev).get("usage")
+                    if isinstance(usage, dict):
+                        last_result_usage = usage
+                elif ev.get("event") == "step_update":
+                    su = ev.get("step_update") or {}
+                    if str(su.get("step_type") or "").lower() == "subagent":
+                        for sub in (su.get("subagent_info") or {}).get("subagents") or []:
+                            luri = str(sub.get("log_uri") or "")
+                            cand: Path | None = None
+                            if luri.startswith("file://"):
+                                p = Path(luri[len("file://") :])
+                                if p.is_file():
+                                    cand = p
+                            if cand is None and sub.get("conversation_id"):
+                                cand = self._transcript_path(str(sub["conversation_id"]))
+                            if cand is not None:
+                                r = cand.resolve()
+                                if r not in seen_sub_paths:
+                                    seen_sub_paths.add(r)
+                                    sub_paths.append(r)
+
+            if not parent_by_model and last_result_usage:
+                m = self.model or "agy"
+                parent_by_model[m] = ModelUsage(
+                    model=m,
+                    input_tokens=int(last_result_usage.get("input_tokens") or 0),
+                    output_tokens=int(last_result_usage.get("output_tokens") or 0),
+                    cache_read_tokens=int(last_result_usage.get("cache_read_tokens") or 0),
+                )
+
+        sub_by_model: dict[str, ModelUsage] = {}
+        for sp in sub_paths:
+            for m, u in self._usage_from_transcript(sp).items():
+                dst = sub_by_model.setdefault(m, ModelUsage(model=m))
+                dst.input_tokens += u.input_tokens
+                dst.output_tokens += u.output_tokens
+                dst.cache_read_tokens += u.cache_read_tokens
+
+        models = list(parent_by_model.values())
+        sub_models = list(sub_by_model.values())
+        est_parts = [estimate_model_cost_usd(u, env=self.base_env) for u in models + sub_models]
+        known = [c for c in est_parts if c is not None]
+        est_total = sum(known) if known else None
+        return UsageSummary(
+            models=models,
+            subagent_models=sub_models,
+            estimated_cost_usd=est_total,
+            cost_note="(estimated from API-equivalent token rates)" if est_total is not None else "",
+        )

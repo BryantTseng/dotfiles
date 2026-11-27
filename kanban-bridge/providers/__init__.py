@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import json
+import os
 from pathlib import Path
 import threading
 from typing import Callable
@@ -98,6 +100,7 @@ class AgentResult:
     text: str
     session_id: str | None = None
     is_error: bool = False
+    model: str | None = None
 
 
 @dataclass
@@ -107,6 +110,153 @@ class SubagentAudit:
     prompt: str = ""
     tool_calls: list[str] = field(default_factory=list)
     final_report: str = ""
+
+
+@dataclass
+class ModelUsage:
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reported_cost_usd: float | None = None
+
+
+@dataclass
+class UsageSummary:
+    models: list[ModelUsage] = field(default_factory=list)
+    subagent_models: list[ModelUsage] = field(default_factory=list)
+    reported_cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
+    cost_note: str = ""
+
+    @property
+    def primary_cost_usd(self) -> float | None:
+        return self.reported_cost_usd if self.reported_cost_usd is not None else self.estimated_cost_usd
+
+
+# Published API-equivalent USD per 1M tokens: (input, output, cache_read, cache_write).
+# Override or extend via `BRIDGE_MODEL_PRICING` JSON env var, e.g. '{"my-model": [1.5, 6.0, 0.15, 0.0]}'.
+DEFAULT_MODEL_PRICING: dict[str, tuple[float, float, float, float]] = {
+    # Claude 4.x / 3.x
+    "claude-opus-4": (15.0, 75.0, 1.50, 18.75),
+    "claude-sonnet-4": (3.0, 15.0, 0.30, 3.75),
+    "claude-haiku-4": (1.0, 5.0, 0.10, 1.25),
+    "claude-3-7-sonnet": (3.0, 15.0, 0.30, 3.75),
+    "claude-3-5-sonnet": (3.0, 15.0, 0.30, 3.75),
+    "claude-3-5-haiku": (0.80, 4.0, 0.08, 1.00),
+    "claude-3-opus": (15.0, 75.0, 1.50, 18.75),
+    # Gemini / Agy tiers (API-equivalent estimates)
+    "gemini-2.5-pro": (1.25, 10.0, 0.3125, 0.0),
+    "gemini-2.5-flash-lite": (0.10, 0.40, 0.025, 0.0),
+    "gemini-2.5-flash": (0.30, 2.50, 0.075, 0.0),
+    "gemini-3.5-flash-lite": (0.10, 0.40, 0.025, 0.0),
+    "gemini-3.5-flash": (0.30, 2.50, 0.075, 0.0),
+    "gemini-4-hydrogen-high": (2.50, 15.0, 0.625, 0.0),
+    "gemini-4-hydrogen-medium": (1.25, 10.0, 0.3125, 0.0),
+    "gemini-4-hydrogen-low": (0.50, 3.0, 0.125, 0.0),
+    # Generic substring fallbacks
+    "opus": (15.0, 75.0, 1.50, 18.75),
+    "sonnet": (3.0, 15.0, 0.30, 3.75),
+    "haiku": (1.0, 5.0, 0.10, 1.25),
+    "flash-lite": (0.10, 0.40, 0.025, 0.0),
+    "flash_lite": (0.10, 0.40, 0.025, 0.0),
+    "flash": (0.30, 2.50, 0.075, 0.0),
+    "hydrogen": (1.25, 10.0, 0.3125, 0.0),
+    "pro": (1.25, 10.0, 0.3125, 0.0),
+}
+
+
+def _load_pricing_table(env: dict[str, str] | None = None) -> dict[str, tuple[float, float, float, float]]:
+    table = dict(DEFAULT_MODEL_PRICING)
+    raw = (env if env is not None else os.environ).get("BRIDGE_MODEL_PRICING", "").strip()
+    if raw:
+        try:
+            overrides = json.loads(raw)
+            if isinstance(overrides, dict):
+                for k, v in overrides.items():
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        inp = float(v[0])
+                        out = float(v[1])
+                        cr = float(v[2]) if len(v) >= 3 else inp * 0.1
+                        cw = float(v[3]) if len(v) >= 4 else 0.0
+                        table[str(k).strip().lower()] = (inp, out, cr, cw)
+        except Exception:
+            pass
+    return table
+
+
+def estimate_model_cost_usd(
+    usage: ModelUsage, env: dict[str, str] | None = None
+) -> float | None:
+    """Return reported USD cost if present, else estimate from token counts & rate table."""
+    if usage.reported_cost_usd is not None:
+        return usage.reported_cost_usd
+    if not (usage.input_tokens or usage.output_tokens or usage.cache_read_tokens or usage.cache_write_tokens):
+        return 0.0
+    table = _load_pricing_table(env)
+    m = (usage.model or "").strip().lower()
+    rates: tuple[float, float, float, float] | None = None
+    # Prefer longest prefix match, then longest substring match.
+    for key in sorted(table, key=len, reverse=True):
+        if m.startswith(key):
+            rates = table[key]
+            break
+    if rates is None:
+        for key in sorted(table, key=len, reverse=True):
+            if key in m:
+                rates = table[key]
+                break
+    if rates is None:
+        return None
+    r_in, r_out, r_cr, r_cw = rates
+    return (
+        usage.input_tokens * r_in
+        + usage.output_tokens * r_out
+        + usage.cache_read_tokens * r_cr
+        + usage.cache_write_tokens * r_cw
+    ) / 1_000_000.0
+
+
+def format_usage_summary(summary: UsageSummary) -> str:
+    """Render a compact markdown cost & token summary for audit dossiers and comments."""
+    all_rows = [(False, u) for u in summary.models] + [(True, u) for u in summary.subagent_models]
+    if not all_rows and summary.primary_cost_usd is None:
+        return ""
+
+    cost = summary.primary_cost_usd
+    if cost is not None:
+        prefix = "" if summary.reported_cost_usd is not None else "~"
+        cost_str = f"**{prefix}${cost:.4f}**" if cost < 0.10 else f"**{prefix}${cost:.2f}**"
+    else:
+        cost_str = "**unknown**"
+    note = f" _{summary.cost_note}_" if summary.cost_note else ""
+
+    tot_in = sum(u.input_tokens for _, u in all_rows)
+    tot_cr = sum(u.cache_read_tokens for _, u in all_rows)
+    tot_cw = sum(u.cache_write_tokens for _, u in all_rows)
+    tot_out = sum(u.output_tokens for _, u in all_rows)
+
+    tok_parts = [f"{tot_in:,} in"]
+    if tot_cr:
+        tok_parts.append(f"{tot_cr:,} cache-read")
+    if tot_cw:
+        tok_parts.append(f"{tot_cw:,} cache-write")
+    tok_parts.append(f"{tot_out:,} out")
+
+    lines = [f"💰 **Estimated Cost:** {cost_str} ({', '.join(tok_parts)}){note}"]
+    for is_sub, u in all_rows:
+        tag = f"subagent `{u.model}`" if is_sub else f"`{u.model}`"
+        mc = estimate_model_cost_usd(u)
+        mc_str = f" (~${mc:.4f})" if mc is not None else ""
+        u_parts = [f"{u.input_tokens:,} in"]
+        if u.cache_read_tokens:
+            u_parts.append(f"{u.cache_read_tokens:,} cache-read")
+        if u.cache_write_tokens:
+            u_parts.append(f"{u.cache_write_tokens:,} cache-write")
+        u_parts.append(f"{u.output_tokens:,} out")
+        lines.append(f"- {tag}: {', '.join(u_parts)}{mc_str}")
+    return "\n".join(lines)
 
 
 class BoardProvider(ABC):
@@ -257,6 +407,12 @@ class AgentProvider(ABC):
     ) -> list[SubagentAudit]:
         """Return per-subagent prompts, tool calls, and final reports for the auditor dossier."""
         return []
+
+    def extract_usage_summary(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> UsageSummary:
+        """Return token counts and reported/estimated USD cost across parent + subagents."""
+        return UsageSummary()
 
     def force_cleanup(self) -> None:
         """Optional cleanup of leftover agent processes/containers on startup or forced stop."""

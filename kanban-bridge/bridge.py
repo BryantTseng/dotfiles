@@ -49,6 +49,7 @@ from providers import (
     BoardProvider,
     Comment,
     Task,
+    format_usage_summary,
     is_valid_proxy_token,
     load_agent_provider,
     load_board_provider,
@@ -77,6 +78,8 @@ SCRATCH_LABEL = "scratch"
 REPO_LABEL_PREFIX = "repo:"
 SESSION_PREFIX = "session:"
 SESSION_COLOR = "9e9e9e"
+MODEL_LABEL_PREFIX = "model:"
+MODEL_LABEL_COLOR = "00acc1"
 INTAKE_HEAD = "⚙️ Configure this run"
 REQUIRE_INTAKE = ENV.get("BRIDGE_REQUIRE_INTAKE", "1") == "1"
 
@@ -1550,6 +1553,14 @@ def run_task(
                 subtask_thread.join(timeout=10)
             if result.session_id and not attached_session_id and new_session:
                 on_session_id(result.session_id)
+            if result.model:
+                model_lbl = f"{MODEL_LABEL_PREFIX}{result.model}"
+                if model_lbl not in task.label_titles:
+                    try:
+                        BOARD.add_label(task_id, model_lbl, MODEL_LABEL_COLOR)
+                        log.info("task %s: attached model label %s", task_id, model_lbl)
+                    except Exception:
+                        log.warning("task %s: attaching model label %s failed", task_id, model_lbl, exc_info=True)
 
             reply, status = split_status(result.text)
             if plan_only:
@@ -1694,7 +1705,8 @@ AUDITOR_PROMPT = (
     "You are an independent read-only auditor reviewing work an AI coding agent did for a kanban task. "
     "The input is a dossier: the task, the comment thread between the user and the agent, every "
     "tool call the agent made (from the bridge's host-side log), every subagent spawned during the run "
-    "(what it was asked, its own tool calls, and its final report), the git diff of what changed in the "
+    "(what it was asked, its own tool calls, and its final report), token usage and estimated cost, "
+    "the git diff of what changed in the "
     "task directory since the last audit, and the files now in it. You may read/search files "
     "in the task directory to verify the work; do NOT modify any files or run commands.\n"
     "The agent (and any subagents it spawned) was only allowed to modify files inside the task directory. Check for:\n"
@@ -1728,7 +1740,13 @@ def audit_base(cwd: Path, repo_ctx: dict | None = None) -> str:
     return git(cwd, "rev-list", "--max-parents=0", "HEAD").splitlines()[0]
 
 
-def build_dossier(task: Task, session_id: str, cwd: Path, repo_ctx: dict | None = None) -> str:
+def build_dossier(
+    task: Task,
+    session_id: str,
+    cwd: Path,
+    repo_ctx: dict | None = None,
+    usage_md: str = "",
+) -> str:
     comments = BOARD.get_comments(task.id)
     thread = [
         f"[{c.author_username or '?'}] {c.body_text[:2000]}"
@@ -1777,12 +1795,15 @@ def build_dossier(task: Task, session_id: str, cwd: Path, repo_ctx: dict | None 
             if sub.final_report:
                 subagent_lines.append(f"**Final report:** {sub.final_report}")
 
+    usage_lines = ["\n## Token usage & cost estimate", usage_md] if usage_md else []
+
     parts = [
         f"# Task #{task.id}: {task.title}",
         task.description_text or "(no description)",
         scope_header,
         "\n## Comment thread",
         *thread,
+        *usage_lines,
         f"\n## Agent tool calls ({len(calls)})",
         *calls,
         *subagent_lines,
@@ -1821,11 +1842,13 @@ def audit_task(
 ) -> None:
     log.info("task %s: auditing", task.id)
     verdict, flags = "FLAGGED", []
+    usage_summary = AGENT.extract_usage_summary(session_id, LOGS_DIR, task_id=task.id)
+    usage_md = format_usage_summary(usage_summary)
     try:
         body = AGENT.run_audit(
             task=task,
             auditor_prompt=AUDITOR_PROMPT,
-            dossier=build_dossier(task, session_id, cwd, repo_ctx=repo_ctx),
+            dossier=build_dossier(task, session_id, cwd, repo_ctx=repo_ctx, usage_md=usage_md),
             cwd=cwd,
             timeout=RUN_TIMEOUT,
             procs=_procs,
@@ -1851,7 +1874,8 @@ def audit_task(
         return
 
     head = "✅ OK" if verdict == "OK" else f"⚠️ Flagged ({', '.join(flags) or 'see below'})"
-    BOARD.publish(task.id, placeholder.id, f"### 🔍 Audit: {head}\n\n{body}")
+    cost_section = f"\n\n---\n{usage_md}" if usage_md else ""
+    BOARD.publish(task.id, placeholder.id, f"### 🔍 Audit: {head}\n\n{body}{cost_section}")
     if not repo_ctx:
         git(cwd, "tag", "-f", "audited")
 
@@ -1859,6 +1883,14 @@ def audit_task(
     BOARD.remove_labels(task, lambda t: t.startswith(FLAG_PREFIX))
     for f in flags:
         BOARD.add_label(task.id, FLAG_PREFIX + f, FLAG_COLOR)
+    for mu in usage_summary.models:
+        if mu.model and mu.model not in ("agy", "claude"):
+            mlbl = f"{MODEL_LABEL_PREFIX}{mu.model}"
+            if mlbl not in task.label_titles:
+                try:
+                    BOARD.add_label(task.id, mlbl, MODEL_LABEL_COLOR)
+                except Exception:
+                    log.warning("task %s: attaching model label %s failed", task.id, mlbl, exc_info=True)
     BOARD.add_label(task.id, AUDITED_LABEL, AUDITED_COLOR)
 
     if verdict == "OK":

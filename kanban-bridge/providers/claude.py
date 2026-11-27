@@ -36,8 +36,11 @@ from typing import Callable
 from providers import (
     AgentProvider,
     AgentResult,
+    ModelUsage,
     SubagentAudit,
     Task,
+    UsageSummary,
+    estimate_model_cost_usd,
     register_proxy_token,
     unregister_proxy_token,
 )
@@ -267,6 +270,7 @@ class ClaudeAgent(AgentProvider):
             steps = 0
             last_step: str | None = None
             result_ev: dict | None = None
+            detected_model: str | None = self.model
             subagent_by_id: dict[str, str] = {}  # tool_use_id -> item label
             subtask_state: dict[str, bool] = {}  # item_text -> is_completed
             stop_ticker = threading.Event()
@@ -299,7 +303,10 @@ class ClaudeAgent(AgentProvider):
                         continue
                     ev_type = ev.get("type")
                     if ev_type == "assistant":
-                        for item in (ev.get("message") or {}).get("content") or []:
+                        msg = ev.get("message") or {}
+                        if not ev.get("parent_tool_use_id") and msg.get("model"):
+                            detected_model = str(msg["model"]).strip()
+                        for item in msg.get("content") or []:
                             if item.get("type") == "tool_use":
                                 steps += 1
                                 last_step = _describe_tool(item)
@@ -346,7 +353,13 @@ class ClaudeAgent(AgentProvider):
                     text=f"⚠️ Claude failed (exit {p.returncode}):\n\n```\n{stderr_tail}\n```",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
+
+            if not detected_model and isinstance(result_ev.get("modelUsage"), dict):
+                mu_keys = [str(k).strip() for k in result_ev["modelUsage"].keys() if k]
+                if mu_keys:
+                    detected_model = mu_keys[0]
 
             text = (result_ev.get("result") or "").strip()
             subtype = result_ev.get("subtype", "success")
@@ -356,14 +369,21 @@ class ClaudeAgent(AgentProvider):
                     text=f"⚠️ Claude stopped early ({subtype}).\n\n{text}".strip(),
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
             if is_err:
                 return AgentResult(
                     text=f"⚠️ Claude ended with an error:\n\n{text}",
                     session_id=session_id,
                     is_error=True,
+                    model=detected_model,
                 )
-            return AgentResult(text=text or "(no output)", session_id=session_id, is_error=False)
+            return AgentResult(
+                text=text or "(no output)",
+                session_id=session_id,
+                is_error=False,
+                model=detected_model,
+            )
 
     def _build_docker_cmd(
         self,
@@ -797,6 +817,88 @@ class ClaudeAgent(AgentProvider):
                 )
             )
         return audits
+
+    def extract_usage_summary(
+        self, session_id: str, log_dir: Path, task_id: str | None = None
+    ) -> UsageSummary:
+        primary = log_dir / f"{session_id}.jsonl"
+        files = [primary] if primary.exists() else self._transcript_files(session_id, log_dir, task_id=task_id)
+        if not files:
+            return UsageSummary()
+
+        reported_total = 0.0
+        has_reported = False
+        result_by_model: dict[str, ModelUsage] = {}
+        parent_by_model: dict[str, ModelUsage] = {}
+        sub_by_model: dict[str, ModelUsage] = {}
+        seen_msg_ids: set[str] = set()
+
+        for f in files:
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ev_type = ev.get("type")
+                if ev_type == "result":
+                    if ev.get("total_cost_usd") is not None:
+                        reported_total += float(ev["total_cost_usd"])
+                        has_reported = True
+                    mu = ev.get("modelUsage")
+                    if isinstance(mu, dict):
+                        for mname, info in mu.items():
+                            if not isinstance(info, dict):
+                                continue
+                            m = str(mname).strip() or "claude"
+                            u = result_by_model.setdefault(m, ModelUsage(model=m))
+                            u.input_tokens += int(info.get("inputTokens") or 0)
+                            u.output_tokens += int(info.get("outputTokens") or 0)
+                            u.cache_read_tokens += int(info.get("cacheReadInputTokens") or 0)
+                            u.cache_write_tokens += int(info.get("cacheCreationInputTokens") or 0)
+                            if info.get("costUSD") is not None:
+                                u.reported_cost_usd = (u.reported_cost_usd or 0.0) + float(info["costUSD"])
+                elif ev_type == "assistant":
+                    msg = ev.get("message") or {}
+                    mid = str(msg.get("id") or "")
+                    if mid:
+                        if mid in seen_msg_ids:
+                            continue
+                        seen_msg_ids.add(mid)
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    m = str(msg.get("model") or self.model or "claude").strip() or "claude"
+                    bucket = sub_by_model if ev.get("parent_tool_use_id") else parent_by_model
+                    u = bucket.setdefault(m, ModelUsage(model=m))
+                    u.input_tokens += int(usage.get("input_tokens") or 0)
+                    u.output_tokens += int(usage.get("output_tokens") or 0)
+                    u.cache_read_tokens += int(usage.get("cache_read_input_tokens") or 0)
+                    u.cache_write_tokens += int(usage.get("cache_creation_input_tokens") or 0)
+
+        if result_by_model:
+            models = list(result_by_model.values())
+            sub_models: list[ModelUsage] = []
+        else:
+            models = list(parent_by_model.values())
+            sub_models = list(sub_by_model.values())
+
+        if has_reported:
+            return UsageSummary(
+                models=models,
+                subagent_models=sub_models,
+                reported_cost_usd=reported_total,
+                cost_note="(reported by Claude Code)",
+            )
+
+        est_parts = [estimate_model_cost_usd(u, env=self.base_env) for u in models + sub_models]
+        known = [c for c in est_parts if c is not None]
+        est_total = sum(known) if known else None
+        return UsageSummary(
+            models=models,
+            subagent_models=sub_models,
+            estimated_cost_usd=est_total,
+            cost_note="(estimated from API-equivalent token rates)" if est_total is not None else "",
+        )
 
     def force_cleanup(self) -> None:
         if self.mode != "docker":

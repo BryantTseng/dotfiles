@@ -11,8 +11,8 @@ Operational notes for AI agents (`agy`, `claudecode`, etc.) working in this repo
 ## Active Board (Planka v2)
 - **URL & IDs:** Read `PLANKA_URL` and `BRIDGE_TRIGGER_LABEL` from `~/.config/kanban-bridge/env` (or run `kanban.py board`) — never hardcode machine-specific board/list/label IDs in shared docs/code.
 - **Columns:** `Backlog` *(parked/ignored)*, `To-Do`, `Need Action`, `Doing`, `Pending`, `Auditing`, `Done` *(closed)*, `Flagged`
-- **Labels:** `<BRIDGE_TRIGGER_LABEL>` (e.g. `agy`/`claude`), `plan-first` / `direct`, `worktree` / `in-place` / `scratch`, `repo:<name>`
-- **Done & Audit policy:** Cards **never** move to **Done** automatically — finished runs and clean audits land in **Pending** until the user drags the card to **Done** or comments `done` / `mark done` / `move to done` / `close` (0 tokens). Audits run **only** when the user explicitly moves a card into **Auditing** (and cover both the parent run and any spawned subagents).
+- **Labels:** `<BRIDGE_TRIGGER_LABEL>` (e.g. `agy`/`claude`), `plan-first` / `direct`, `worktree` / `in-place` / `scratch`, `repo:<name>`, `model:<model-name>` (auto-attached)
+- **Done & Audit policy:** Cards **never** move to **Done** automatically — finished runs and clean audits land in **Pending** until the user drags the card to **Done** or comments `done` / `mark done` / `move to done` / `close` (0 tokens). Audits run **only** when the user explicitly moves a card into **Auditing** (covering both parent + spawned subagents and appending a `💰 Estimated Cost` breakdown to the audit comment).
 
 ## Architecture
 - `bridge.py`: Core orchestrator (queueing, 2-slot cap, Backlog parking, `/setup` intake, `plan-first` gate, git worktrees, two-way Planka attachment sync with Docker workdir remapping, subagent-aware audits, access flow, `BRIDGE_NOTIFY`, auth proxy, graceful/forced shutdown, auto-reload via exit code `3`).

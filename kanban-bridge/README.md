@@ -16,9 +16,10 @@ A self-hosted **Planka v2** kanban board bridged to headless **`agy --sandbox`**
   3. **Need Action** — agent asked a question, requested access, needs `/setup` config, or failed
   4. **Doing** — actively running (30-second live progress updates on placeholder comment)
   5. **Pending** — agent finished its run (`STATUS: DONE`) or passed **Auditing**; ready for **your** review, live test, or deployment
-  6. **Auditing** — **manual audit trigger**; drag any card here to run the read-only auditor across the parent run **and** every spawned subagent (clean → **Pending**, problems → **Flagged**)
+  6. **Auditing** — **manual audit trigger**; drag any card here to run the read-only auditor across the parent run **and** every spawned subagent, including a **💰 Estimated Cost** breakdown (exact USD when reported by Claude Code, or API-equivalent token estimate; clean → **Pending**, problems → **Flagged**)
   7. **Done** *(closed list)* — **never entered automatically**; only moved here when you drag the card manually or comment `done` / `mark done` / `move to done` / `close` (0 tokens)
   8. **Flagged** — auditor found issues (`audit:<flag>` red labels)
+- **Model Labels (`model:<name>`):** The bridge automatically attaches the model used by the run (e.g. `model:gemini-4-hydrogen-medium`, `model:claude-sonnet-4-6`) as a sky-blue label on the card.
 - **Notifications:** Linux uses `notify-send` when `BRIDGE_NOTIFY=auto` (default); set `BRIDGE_NOTIFY=off` to disable desktop popups (e.g. on macOS when using the optional `swiftbar/kanban.30s.py` menu-bar plugin).
 - **Native Planka Checklists (`CHECKLIST:` + Live `Subagents & Tasks`):**
   - **Live automatic tracking:** Whenever an agent spawns a subagent, swarm worker, workflow, or background command (`agy`: `invoke_subagent`, `swarm`, `run_workflow`, backgrounded `run_command`; `claude`: `Agent`/`Task`, `TodoWrite`), the bridge syncs each one live into a **`Subagents & Tasks`** Task List on the card (`showOnFrontOfCard: true`) and checks items off as they finish (or on clean turn completion).

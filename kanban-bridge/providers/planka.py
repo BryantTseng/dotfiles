@@ -45,6 +45,7 @@ HEX_TO_PLANKA_COLOR = {
     "1e88e5": "antique-blue",    # repo:*
     "fb8c00": "pumpkin-orange",  # in-place
     "43a047": "sunny-grass",     # direct
+    "00acc1": "sky-blue",        # model:*
 }
 
 

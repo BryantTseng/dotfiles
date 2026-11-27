@@ -15,7 +15,10 @@ if str(ROOT) not in sys.path:
 
 from providers import (
     Attachment,
+    ModelUsage,
     Task,
+    estimate_model_cost_usd,
+    format_usage_summary,
     is_valid_proxy_token,
     load_agent_provider,
     register_proxy_token,
@@ -910,6 +913,150 @@ class TestCrossPlatformWorkdirBacklogAndSubagentAudits(unittest.TestCase):
             self.assertEqual(len(subs[0].tool_calls), 2)
             self.assertIn("- run_command:", subs[0].tool_calls[0])
             self.assertEqual(subs[0].final_report, "Only .git exists.")
+
+    def test_claude_model_detection_and_reported_cost_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            events = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "m1",
+                        "model": "claude-sonnet-4-6",
+                        "content": [{"type": "text", "text": "Working"}],
+                        "usage": {"input_tokens": 1000, "output_tokens": 200},
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "parent_tool_use_id": "tu_sub",
+                    "message": {
+                        "id": "m2",
+                        "model": "claude-haiku-4-5-20251001",
+                        "content": [{"type": "text", "text": "Subagent"}],
+                        "usage": {"input_tokens": 500, "output_tokens": 100},
+                    },
+                },
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "Done.\nSTATUS: DONE",
+                    "total_cost_usd": 0.0425,
+                    "modelUsage": {
+                        "claude-sonnet-4-6": {
+                            "inputTokens": 1000,
+                            "outputTokens": 200,
+                            "cacheReadInputTokens": 4000,
+                            "costUSD": 0.04,
+                        },
+                        "claude-haiku-4-5-20251001": {
+                            "inputTokens": 500,
+                            "outputTokens": 100,
+                            "costUSD": 0.0025,
+                        },
+                    },
+                },
+            ]
+            fake_cmd = [sys.executable, "-c", "print(" + repr("\n".join(json.dumps(e) for e in events)) + ")"]
+            agent = ClaudeAgent(claude_bin=sys.executable, mode="host", base_env={}, state_root=log_dir / "state")
+            res = agent._run_streaming(
+                cmd=fake_cmd,
+                cwd=log_dir,
+                env={},
+                timeout=30,
+                procs=set(),
+                log_path=log_dir / "s-cost.jsonl",
+                session_id="s-cost",
+            )
+            # Parent model is sonnet (not overridden by subagent haiku)
+            self.assertEqual(res.model, "claude-sonnet-4-6")
+
+            summary = agent.extract_usage_summary("s-cost", log_dir)
+            self.assertAlmostEqual(summary.reported_cost_usd or 0.0, 0.0425, places=6)
+            md = format_usage_summary(summary)
+            self.assertIn("💰 **Estimated Cost:** **$0.0425**", md)
+            self.assertIn("`claude-sonnet-4-6`", md)
+            self.assertIn("reported by Claude Code", md)
+
+    def test_agy_model_detection_and_usage_cost_estimation_with_subagents(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent_transcript = root / "parent-transcript.jsonl"
+            parent_transcript.write_text(
+                "\n".join(
+                    json.dumps(x)
+                    for x in [
+                        {
+                            "type": "PLANNER_RESPONSE",
+                            "model": "gemini-4-hydrogen-medium",
+                            "input_tokens": 10000,
+                            "cache_read_tokens": 20000,
+                            "output_tokens": 1000,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            child_transcript = root / "child-transcript.jsonl"
+            child_transcript.write_text(
+                "\n".join(
+                    json.dumps(x)
+                    for x in [
+                        {
+                            "type": "PLANNER_RESPONSE",
+                            "model": "gemini-3.5-flash-lite",
+                            "input_tokens": 5000,
+                            "cache_read_tokens": 0,
+                            "output_tokens": 500,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            parent_log = root / "agy-s1.jsonl"
+            parent_log.write_text(
+                json.dumps(
+                    {
+                        "event": "step_update",
+                        "step_update": {
+                            "step_type": "subagent",
+                            "step_index": 2,
+                            "state": "DONE",
+                            "subagent_info": {
+                                "subagents": [
+                                    {"role": "Researcher", "conversation_id": "c1", "log_uri": f"file://{child_transcript}"}
+                                ]
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            agent = AgyAgent(agy_bin=sys.executable, base_env={})
+            with mock.patch.object(AgyAgent, "_transcript_path", return_value=parent_transcript):
+                self.assertEqual(agent._detect_model("agy-s1"), "gemini-4-hydrogen-medium")
+                summary = agent.extract_usage_summary("agy-s1", root)
+
+            self.assertEqual([u.model for u in summary.models], ["gemini-4-hydrogen-medium"])
+            self.assertEqual([u.model for u in summary.subagent_models], ["gemini-3.5-flash-lite"])
+            self.assertIsNotNone(summary.estimated_cost_usd)
+            assert summary.estimated_cost_usd is not None
+            self.assertGreater(summary.estimated_cost_usd, 0.0)
+            md = format_usage_summary(summary)
+            self.assertIn("💰 **Estimated Cost:** **~$", md)
+            self.assertIn("`gemini-4-hydrogen-medium`", md)
+            self.assertIn("subagent `gemini-3.5-flash-lite`", md)
+
+            # Custom BRIDGE_MODEL_PRICING override
+            custom = estimate_model_cost_usd(
+                ModelUsage(model="custom-xl", input_tokens=1_000_000, output_tokens=1_000_000),
+                env={"BRIDGE_MODEL_PRICING": '{"custom-xl": [2.0, 8.0, 0.2, 0.0]}'},
+            )
+            self.assertAlmostEqual(custom or 0.0, 10.0, places=6)
 
 
 if __name__ == "__main__":
