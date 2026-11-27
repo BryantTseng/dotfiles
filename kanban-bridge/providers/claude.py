@@ -829,9 +829,9 @@ class ClaudeAgent(AgentProvider):
         reported_total = 0.0
         has_reported = False
         result_by_model: dict[str, ModelUsage] = {}
-        parent_by_model: dict[str, ModelUsage] = {}
-        sub_by_model: dict[str, ModelUsage] = {}
-        seen_msg_ids: set[str] = set()
+        # Keep the LAST assistant event per message.id so streaming updates don't undercount output_tokens.
+        latest_by_msg_id: dict[str, tuple[bool, str, dict]] = {}
+        anon_msgs: list[tuple[bool, str, dict]] = []
 
         for f in files:
             for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -859,21 +859,26 @@ class ClaudeAgent(AgentProvider):
                                 u.reported_cost_usd = (u.reported_cost_usd or 0.0) + float(info["costUSD"])
                 elif ev_type == "assistant":
                     msg = ev.get("message") or {}
-                    mid = str(msg.get("id") or "")
-                    if mid:
-                        if mid in seen_msg_ids:
-                            continue
-                        seen_msg_ids.add(mid)
                     usage = msg.get("usage")
                     if not isinstance(usage, dict):
                         continue
+                    is_sub = bool(ev.get("parent_tool_use_id"))
                     m = str(msg.get("model") or self.model or "claude").strip() or "claude"
-                    bucket = sub_by_model if ev.get("parent_tool_use_id") else parent_by_model
-                    u = bucket.setdefault(m, ModelUsage(model=m))
-                    u.input_tokens += int(usage.get("input_tokens") or 0)
-                    u.output_tokens += int(usage.get("output_tokens") or 0)
-                    u.cache_read_tokens += int(usage.get("cache_read_input_tokens") or 0)
-                    u.cache_write_tokens += int(usage.get("cache_creation_input_tokens") or 0)
+                    mid = str(msg.get("id") or "")
+                    if mid:
+                        latest_by_msg_id[mid] = (is_sub, m, usage)
+                    else:
+                        anon_msgs.append((is_sub, m, usage))
+
+        parent_by_model: dict[str, ModelUsage] = {}
+        sub_by_model: dict[str, ModelUsage] = {}
+        for is_sub, m, usage in list(latest_by_msg_id.values()) + anon_msgs:
+            bucket = sub_by_model if is_sub else parent_by_model
+            u = bucket.setdefault(m, ModelUsage(model=m))
+            u.input_tokens += int(usage.get("input_tokens") or 0)
+            u.output_tokens += int(usage.get("output_tokens") or 0)
+            u.cache_read_tokens += int(usage.get("cache_read_input_tokens") or 0)
+            u.cache_write_tokens += int(usage.get("cache_creation_input_tokens") or 0)
 
         if result_by_model:
             models = list(result_by_model.values())
@@ -897,7 +902,7 @@ class ClaudeAgent(AgentProvider):
             models=models,
             subagent_models=sub_models,
             estimated_cost_usd=est_total,
-            cost_note="(estimated from API-equivalent token rates)" if est_total is not None else "",
+            cost_note="(estimated via OpenRouter pricing)" if est_total is not None else "",
         )
 
     def force_cleanup(self) -> None:

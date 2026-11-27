@@ -787,13 +787,26 @@ class AgyAgent(AgentProvider):
                     cache_read_tokens=int(last_result_usage.get("cache_read_tokens") or 0),
                 )
 
+        # Recursively discover any nested grandchild subagents referenced inside child transcripts.
         sub_by_model: dict[str, ModelUsage] = {}
-        for sp in sub_paths:
+        queue_paths = list(sub_paths)
+        while queue_paths:
+            sp = queue_paths.pop(0)
             for m, u in self._usage_from_transcript(sp).items():
                 dst = sub_by_model.setdefault(m, ModelUsage(model=m))
                 dst.input_tokens += u.input_tokens
                 dst.output_tokens += u.output_tokens
                 dst.cache_read_tokens += u.cache_read_tokens
+            for line in sp.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "logAbsoluteUri" not in line:
+                    continue
+                for uri_m in re.finditer(r'file://([^"\\\s]+transcript\.jsonl)', line):
+                    cand = Path(uri_m.group(1))
+                    if cand.is_file():
+                        r = cand.resolve()
+                        if r not in seen_sub_paths and (tpath is None or r != tpath.resolve()):
+                            seen_sub_paths.add(r)
+                            queue_paths.append(r)
 
         models = list(parent_by_model.values())
         sub_models = list(sub_by_model.values())
@@ -804,5 +817,5 @@ class AgyAgent(AgentProvider):
             models=models,
             subagent_models=sub_models,
             estimated_cost_usd=est_total,
-            cost_note="(estimated from API-equivalent token rates)" if est_total is not None else "",
+            cost_note="(estimated via OpenRouter pricing)" if est_total is not None else "",
         )

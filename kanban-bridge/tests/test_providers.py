@@ -1036,7 +1036,19 @@ class TestCrossPlatformWorkdirBacklogAndSubagentAudits(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            agent = AgyAgent(agy_bin=sys.executable, base_env={})
+            agent = AgyAgent(
+                agy_bin=sys.executable,
+                base_env={
+                    "BRIDGE_STATE_ROOT": str(root),
+                    "BRIDGE_PRICING_URL": "",
+                    "BRIDGE_MODEL_PRICING": json.dumps(
+                        {
+                            "gemini-4-hydrogen": [1.50, 7.50, 0.075, 0.0],
+                            "gemini-3.5-flash-lite": [0.30, 2.50, 0.03, 0.0],
+                        }
+                    ),
+                },
+            )
             with mock.patch.object(AgyAgent, "_transcript_path", return_value=parent_transcript):
                 self.assertEqual(agent._detect_model("agy-s1"), "gemini-4-hydrogen-medium")
                 summary = agent.extract_usage_summary("agy-s1", root)
@@ -1045,18 +1057,94 @@ class TestCrossPlatformWorkdirBacklogAndSubagentAudits(unittest.TestCase):
             self.assertEqual([u.model for u in summary.subagent_models], ["gemini-3.5-flash-lite"])
             self.assertIsNotNone(summary.estimated_cost_usd)
             assert summary.estimated_cost_usd is not None
-            self.assertGreater(summary.estimated_cost_usd, 0.0)
-            md = format_usage_summary(summary)
-            self.assertIn("💰 **Estimated Cost:** **~$", md)
+            # 10k*1.5/1M + 20k*0.075/1M + 1k*7.5/1M + 5k*0.3/1M + 500*2.5/1M = 0.015 + 0.0015 + 0.0075 + 0.0015 + 0.00125 = 0.02675
+            self.assertAlmostEqual(summary.estimated_cost_usd, 0.02675, places=6)
+            md = format_usage_summary(summary, env=agent.base_env)
+            self.assertIn("💰 **Estimated Cost:** **~$0.0268**", md)
             self.assertIn("`gemini-4-hydrogen-medium`", md)
             self.assertIn("subagent `gemini-3.5-flash-lite`", md)
 
-            # Custom BRIDGE_MODEL_PRICING override
-            custom = estimate_model_cost_usd(
-                ModelUsage(model="custom-xl", input_tokens=1_000_000, output_tokens=1_000_000),
-                env={"BRIDGE_MODEL_PRICING": '{"custom-xl": [2.0, 8.0, 0.2, 0.0]}'},
+    def test_openrouter_pricing_6hr_cache_and_slug_matching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp)
+            env = {"BRIDGE_STATE_ROOT": str(state_root)}
+            fetch_count = 0
+            sample_payload = {
+                "data": [
+                    {
+                        "id": "google/gemini-4-hydrogen",
+                        "pricing": {"prompt": "0.0000015", "completion": "0.0000075", "input_cache_read": "0.000000075"},
+                    },
+                    {
+                        "id": "anthropic/claude-sonnet-4.6:batch",
+                        "pricing": {"prompt": "0.0000015", "completion": "0.0000075"},
+                    },
+                    {
+                        "id": "anthropic/claude-sonnet-4.6",
+                        "pricing": {"prompt": "0.000003", "completion": "0.000015", "input_cache_read": "0.0000003"},
+                    },
+                    {
+                        "id": "anthropic/claude-haiku-4.5",
+                        "pricing": {"prompt": "0.000001", "completion": "0.000005", "input_cache_read": "0.0000001"},
+                    },
+                ]
+            }
+
+            def fake_fetch(url: str) -> dict:
+                nonlocal fetch_count
+                fetch_count += 1
+                return sample_payload
+
+            # First call fetches & writes disk cache
+            c1 = estimate_model_cost_usd(
+                ModelUsage(model="gemini-4-hydrogen-medium", input_tokens=1_000_000, output_tokens=1_000_000),
+                env=env,
+                now=1000.0,
+                fetcher=fake_fetch,
             )
-            self.assertAlmostEqual(custom or 0.0, 10.0, places=6)
+            self.assertAlmostEqual(c1 or 0.0, 9.0, places=6)
+            self.assertEqual(fetch_count, 1)
+
+            # Second call within 6 hours hits disk cache (no refetch) and matches dot/hyphen & date suffix
+            c2 = estimate_model_cost_usd(
+                ModelUsage(model="claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=0),
+                env=env,
+                now=1000.0 + 3600.0,
+                fetcher=fake_fetch,
+            )
+            self.assertAlmostEqual(c2 or 0.0, 3.0, places=6)  # NOT 1.5 (:batch ignored!)
+            self.assertEqual(fetch_count, 1)
+
+            c3 = estimate_model_cost_usd(
+                ModelUsage(model="claude-haiku-4-5-20251001", input_tokens=1_000_000, output_tokens=0),
+                env=env,
+                now=1000.0 + 3600.0,
+                fetcher=fake_fetch,
+            )
+            self.assertAlmostEqual(c3 or 0.0, 1.0, places=6)
+            self.assertEqual(fetch_count, 1)
+
+            # After 6 hours (21600s), cache expires and refetches
+            c4 = estimate_model_cost_usd(
+                ModelUsage(model="claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=0),
+                env=env,
+                now=1000.0 + 6 * 3600 + 5,
+                fetcher=fake_fetch,
+            )
+            self.assertAlmostEqual(c4 or 0.0, 3.0, places=6)
+            self.assertEqual(fetch_count, 2)
+
+            # If refetch fails later, stale cache is still used gracefully
+            def fail_fetch(url: str) -> dict:
+                raise RuntimeError("offline")
+
+            c5 = estimate_model_cost_usd(
+                ModelUsage(model="claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=0),
+                env=env,
+                now=1000.0 + 20 * 3600,
+                fetcher=fail_fetch,
+            )
+            self.assertAlmostEqual(c5 or 0.0, 3.0, places=6)
 
 
 if __name__ == "__main__":
