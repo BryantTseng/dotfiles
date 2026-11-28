@@ -1184,6 +1184,55 @@ def handle_access_click(method: str, query: str) -> tuple[int, str]:
     )
 
 
+def sign_proceed(task_id: str, plan_comment_id: str) -> str:
+    msg = f"{task_id}|{plan_comment_id}|proceed"
+    return hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def proceed_block(task_id: str, plan_comment_id: str) -> str:
+    q = urllib.parse.urlencode(
+        {"t": task_id, "c": plan_comment_id, "s": sign_proceed(task_id, plan_comment_id)}
+    )
+    return (
+        f"\n\n---\n**Ready to implement?** [🚀 Do it]({APPROVAL_BASE}/proceed?{q})\n\n"
+        "*or reply `do it`*"
+    )
+
+
+def handle_proceed_click(method: str, query: str) -> tuple[int, str]:
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    try:
+        task_id, comment_id = q["t"], q["c"]
+    except KeyError:
+        return 400, access_page("Bad link", "<p>This link is malformed.</p>")
+
+    if not hmac.compare_digest(q.get("s", ""), sign_proceed(task_id, comment_id)):
+        return 403, access_page("Invalid link", "<p>This link's signature doesn't match.</p>")
+
+    back = f'<p><a href="{BOARD.task_url(task_id)}">Back to the task</a></p>'
+    comments = BOARD.get_comments(task_id)
+    if not comments or comments[-1].id != comment_id:
+        return 409, access_page(
+            "Already answered",
+            "<p>This spec was already answered or superseded.</p>" + back,
+        )
+
+    if method == "GET":
+        return 200, access_page(
+            f"Implement task #{task_id}?",
+            f"<p>{html.escape(AGENT.name)} will exit plan-only mode and implement the spec.</p>",
+            button="Do it",
+        )
+
+    BOARD.post_user_comment(task_id, "do it")
+    enqueue(task_id)
+    return 200, access_page(
+        "Starting implementation",
+        "<p>The agent will start implementing shortly. Returning to card…</p>" + back,
+        auto_close_url=BOARD.task_url(task_id),
+    )
+
+
 # ---------- pre-run intake (workspace mode + plan-first/direct) ----------
 
 LABEL_COLORS = {
@@ -2044,6 +2093,8 @@ def run_task(
     )
     if access_footer:
         planka_reply += access_footer
+    if plan_only and status != "DONE" and not reply.startswith("⚠️"):
+        planka_reply += proceed_block(task_id, placeholder.id)
     if attach_footer:
         planka_reply += attach_footer
     if git_footer:
@@ -2533,6 +2584,14 @@ class Handler(BaseHTTPRequestHandler):
             status, page = 500, access_page("Error", f"<p>{html.escape(str(e))}</p>")
         self._send_html(status, page)
 
+    def _proceed(self, method: str):
+        try:
+            status, page = handle_proceed_click(method, urllib.parse.urlsplit(self.path).query)
+        except Exception as e:
+            log.exception("proceed click failed")
+            status, page = 500, access_page("Error", f"<p>{html.escape(str(e))}</p>")
+        self._send_html(status, page)
+
     def _setup(self, method: str):
         post_body = b""
         if method == "POST":
@@ -2570,6 +2629,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_html(200, DASHBOARD_HTML)
         if self.path.startswith("/access?"):
             return self._access("GET")
+        if self.path.startswith("/proceed?"):
+            return self._proceed("GET")
         if self.path.startswith("/setup?"):
             return self._setup("GET")
         if self.path.startswith("/report?"):
@@ -2636,6 +2697,8 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if self.path.startswith("/access?"):
             return self._access("POST")
+        if self.path.startswith("/proceed?"):
+            return self._proceed("POST")
         if self.path.startswith("/setup?"):
             return self._setup("POST")
         if self.path.startswith("/report?"):
