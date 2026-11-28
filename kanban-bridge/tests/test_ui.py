@@ -125,6 +125,16 @@ class TestUiLogsAndPricing(unittest.TestCase):
         self.assertEqual(len(models), 1)
         self.assertEqual(models[0]["openrouter_id"], "openrouter/google/gemini-2.5-flash")
 
+    def test_model_list_skips_bare_slugs(self):
+        fake_table = {
+            "deepseek/deepseek-v4.1-flash": (0.1e-6, 0.2e-6, 0.0, 0.0),
+            "deepseek-v4.1-flash": (0.1e-6, 0.2e-6, 0.0, 0.0),
+        }
+        with mock.patch("ui._load_openrouter_pricing", return_value=fake_table):
+            models = list_pricing_models({"OPENROUTER_API_KEY": "sk-or-test"})
+
+        self.assertEqual([m["openrouter_id"] for m in models], ["openrouter/deepseek/deepseek-v4.1-flash"])
+
 
 if __name__ == "__main__":
     unittest.main()
