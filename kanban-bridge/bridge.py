@@ -2107,7 +2107,8 @@ def run_task(
 
     if status == "DONE":
         try:
-            BOARD.complete_checklists(task_id, {"Subagents & Tasks"})
+            if not BOARD.open_checklist_items(task_id, exclude_lists={"Subagents & Tasks"}):
+                BOARD.complete_checklists(task_id, {"Subagents & Tasks"})
         except Exception:
             log.warning("task %s: completing Subagents & Tasks checklist failed", task_id, exc_info=True)
         try:

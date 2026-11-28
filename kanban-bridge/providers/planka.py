@@ -576,13 +576,23 @@ class PlankaBoard(BoardProvider):
                 )["item"]
                 by_norm[name.lower()] = created
 
-    def open_checklist_items(self, task_id: str) -> list[str]:
+    def open_checklist_items(
+        self, task_id: str, exclude_lists: set[str] | None = None
+    ) -> list[str]:
         data = self._api("GET", f"/cards/{task_id}") or {}
-        tasks = (data.get("included") or {}).get("tasks") or []
+        inc = data.get("included") or {}
+        tasks = inc.get("tasks") or []
+        skip = {n.strip().lower() for n in exclude_lists} if exclude_lists else set()
+        list_name_by_id = {
+            str(tl["id"]): (tl.get("name") or "").strip().lower()
+            for tl in inc.get("taskLists") or []
+            if tl.get("id") is not None
+        }
         return [
             (t.get("name") or "").strip()
             for t in tasks
             if not t.get("isCompleted")
+            and list_name_by_id.get(str(t.get("taskListId")), "") not in skip
         ]
 
     def complete_checklists(
