@@ -705,6 +705,24 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
         }
         self.assertEqual(board.open_checklist_items("c1"), ["Open item"])
 
+        board._api = lambda method, path, payload=None, *, api_key=None: {  # type: ignore[method-assign]
+            "included": {
+                "taskLists": [
+                    {"id": "l1", "name": "Subagents & Tasks"},
+                    {"id": "l2", "name": "Delivery"},
+                ],
+                "tasks": [
+                    {"id": "t1", "name": "Sub open", "isCompleted": False, "taskListId": "l1"},
+                    {"id": "t2", "name": "Ship it", "isCompleted": False, "taskListId": "l2"},
+                ],
+            }
+        }
+        self.assertEqual(
+            board.open_checklist_items("c1", exclude_lists={"Subagents & Tasks"}),
+            ["Ship it"],
+        )
+        self.assertEqual(board.open_checklist_items("c1"), ["Sub open", "Ship it"])
+
     def test_planka_upload_attachment_url_and_headers(self):
         import io
         from unittest import mock
