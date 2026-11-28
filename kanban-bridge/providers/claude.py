@@ -42,6 +42,7 @@ from providers import (
     UsageSummary,
     estimate_model_cost_usd,
     is_model_fallback_error,
+    describe_step,
     parse_model_list,
     register_proxy_token,
     resolve_model_candidates,
@@ -75,8 +76,7 @@ def _describe_tool(item: dict) -> str:
         or inp.get("url")
         or ""
     )
-    detail = str(detail).replace("\n", " ").strip()
-    return f"{item.get('name')}: {detail[:80]}" if detail else item.get("name", "?")
+    return describe_step(str(item.get("name") or "?"), str(detail))
 
 
 def _kill_proc_group(p: subprocess.Popen, container: str | None = None) -> None:

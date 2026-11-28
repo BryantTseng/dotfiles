@@ -1781,7 +1781,7 @@ class TestOpenCodeAgent(unittest.TestCase):
 
             # Audit extraction
             tools = agent.extract_tool_calls("ses_or_123", tmp_path)
-            self.assertTrue(any("bash: Run cargo test" in t for t in tools))
+            self.assertTrue(any("Run cargo test" in t for t in tools))
             sub_audits = agent.extract_subagent_audits("ses_or_123", tmp_path)
             self.assertEqual(len(sub_audits), 1)
             self.assertEqual(sub_audits[0].name, "Audit dependencies (research)")

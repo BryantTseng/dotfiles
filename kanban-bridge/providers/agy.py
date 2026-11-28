@@ -37,6 +37,7 @@ from providers import (
     UsageSummary,
     estimate_model_cost_usd,
     is_model_fallback_error,
+    describe_step,
     parse_model_list,
     resolve_model_candidates,
 )
@@ -62,7 +63,8 @@ NONZERO_EXIT_RE = re.compile(r"exited with code\s+(?!0\b)\d+", re.IGNORECASE)
 def _describe_tool(tool_name: str, params: dict | None) -> str:
     inp = params or {}
     detail = (
-        inp.get("CommandLine")
+        inp.get("toolSummary")
+        or inp.get("CommandLine")
         or inp.get("Path")
         or inp.get("TargetFile")
         or inp.get("Query")
@@ -72,8 +74,7 @@ def _describe_tool(tool_name: str, params: dict | None) -> str:
         or inp.get("file_path")
         or ""
     )
-    detail = str(detail).replace("\n", " ").strip()
-    return f"{tool_name}: {detail[:80]}" if detail else (tool_name or "?")
+    return describe_step(tool_name or "?", str(detail))
 
 
 def _kill_proc_group(p: subprocess.Popen) -> None:

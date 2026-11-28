@@ -192,6 +192,25 @@ def is_model_fallback_error(text: str | None) -> bool:
     return bool(_MODEL_FALLBACK_ERROR_RE.search(text))
 
 
+_STEP_VERBS = {
+    "bash": "Run", "shell": "Run", "run_command": "Run", "command_status": "Check",
+    "read": "Read", "read_file": "Read", "view_file": "Read",
+    "write": "Write", "write_file": "Write", "edit": "Edit", "multiedit": "Edit",
+    "grep": "Search", "glob": "Find", "ls": "List", "list": "List",
+    "webfetch": "Fetch", "websearch": "Web search",
+    "task": "Subagent", "agent": "Subagent", "invoke_subagent": "Subagent",
+    "todowrite": "Plan",
+}
+
+
+def describe_step(tool: str, detail: str | None = None, limit: int = 80) -> str:
+    """Render a tool call as a short, human-readable `Verb: detail` label shared by all agents."""
+    name = str(tool or "").strip()
+    verb = _STEP_VERBS.get(name.lower()) or name or "Step"
+    text = " ".join(str(detail or "").split())[:limit]
+    return f"{verb}: {text}" if text else verb
+
+
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 PRICING_CACHE_TTL = 6 * 3600  # 6 hours
 _DATE_SUFFIX_RE = re.compile(r"-20\d{6}$")

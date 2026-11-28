@@ -37,6 +37,7 @@ from providers import (
     UsageSummary,
     estimate_model_cost_usd,
     is_model_fallback_error,
+    describe_step,
     parse_model_list,
     resolve_model_candidates,
 )
@@ -107,9 +108,10 @@ def _normalize_model_label(model: str | None) -> str | None:
 def _describe_tool(tool_name: str, state: dict) -> str:
     inp = state.get("input") or {}
     title = str(state.get("title") or "").strip()
+    if title:
+        return " ".join(title.split())[:80]
     detail = (
-        title
-        or inp.get("description")
+        inp.get("description")
         or inp.get("command")
         or inp.get("filePath")
         or inp.get("file_path")
@@ -118,8 +120,7 @@ def _describe_tool(tool_name: str, state: dict) -> str:
         or inp.get("url")
         or ""
     )
-    detail = str(detail).replace("\n", " ").strip()
-    return f"{tool_name}: {detail[:80]}" if detail else tool_name
+    return describe_step(tool_name, str(detail))
 
 
 def _extract_error_text(ev: dict) -> str:
