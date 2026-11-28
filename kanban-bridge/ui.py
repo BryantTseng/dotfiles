@@ -196,6 +196,8 @@ def list_pricing_models(env: dict[str, str], query: str = "", limit: int = 2000)
     q = query.strip().lower()
     out: list[dict[str, Any]] = []
     for model_id in sorted(table):
+        if "/" not in model_id:
+            continue
         if q and q not in model_id:
             continue
         r = table[model_id]
