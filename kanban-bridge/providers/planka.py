@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from providers import Attachment, BoardProvider, Comment, Label, Task, WebhookEvent
 
@@ -296,6 +296,42 @@ class PlankaBoard(BoardProvider):
                 except urllib.error.HTTPError as e:
                     log.warning("could not upgrade bot role on board %s: %s", bid, e)
 
+    def list_boards(self) -> list[dict[str, Any]]:
+        proj_data = self._api("GET", "/projects") or {}
+        boards = (proj_data.get("included") or {}).get("boards") or []
+        out: list[dict[str, Any]] = []
+        for b in boards:
+            bid = str(b["id"])
+            bundle = self._get_board_bundle(bid)
+            item = bundle.get("item") or b
+            bname = item.get("name") or bid
+            inc = bundle.get("included") or {}
+            lists = sorted(
+                [
+                    l
+                    for l in (inc.get("lists") or [])
+                    if l.get("type") in ("active", "closed") and l.get("name")
+                ],
+                key=lambda l: l.get("position") or 0,
+            )
+            list_names = [str(l["name"]).strip() for l in lists]
+            active_list_ids = {str(l["id"]) for l in lists}
+            cards = [
+                c
+                for c in (inc.get("cards") or [])
+                if str(c.get("listId") or "") in active_list_ids
+            ]
+            out.append(
+                {
+                    "id": bid,
+                    "name": bname,
+                    "url": f"{self.base_url}/boards/{bid}",
+                    "columns": list_names,
+                    "card_count": len(cards),
+                }
+            )
+        return out
+
     def get_task(self, task_id: str) -> Task:
         data = self._api("GET", f"/cards/{task_id}") or {}
         card = data["item"]
@@ -539,6 +575,39 @@ class PlankaBoard(BoardProvider):
                     api_key=self.bot_api_key,
                 )["item"]
                 by_norm[name.lower()] = created
+
+    def complete_checklists(
+        self, task_id: str, list_names: set[str] | None = None
+    ) -> int:
+        """Mark incomplete items completed in matching task lists (or all lists if None)."""
+        data = self._api("GET", f"/cards/{task_id}") or {}
+        inc = data.get("included") or {}
+        task_lists = inc.get("taskLists") or []
+        tasks = inc.get("tasks") or []
+        if not tasks:
+            return 0
+        norm_targets = {n.strip().lower() for n in list_names} if list_names is not None else None
+        list_name_by_id = {
+            str(tl["id"]): (tl.get("name") or "").strip().lower()
+            for tl in task_lists
+            if tl.get("id") is not None
+        }
+        updated = 0
+        for item in tasks:
+            if bool(item.get("isCompleted")):
+                continue
+            if norm_targets is not None:
+                lname = list_name_by_id.get(str(item.get("taskListId")), "")
+                if lname not in norm_targets:
+                    continue
+            self._api(
+                "PATCH",
+                f"/tasks/{item['id']}",
+                {"isCompleted": True},
+                api_key=self.bot_api_key,
+            )
+            updated += 1
+        return updated
 
     def _rewrite_local_url(self, raw_url: str) -> str:
         """Rewrite a Planka attachment URL onto self.base_url (preserving path & query)."""

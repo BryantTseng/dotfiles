@@ -41,7 +41,10 @@ from providers import (
     Task,
     UsageSummary,
     estimate_model_cost_usd,
+    is_model_fallback_error,
+    parse_model_list,
     register_proxy_token,
+    resolve_model_candidates,
     unregister_proxy_token,
 )
 
@@ -90,37 +93,51 @@ def _kill_proc_group(p: subprocess.Popen, container: str | None = None) -> None:
             pass
 
 
+def _resolve_parent_git(repo_dir: Path) -> Path | None:
+    dot_git = repo_dir / ".git"
+    if not dot_git.is_file():
+        return None
+    try:
+        line = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+        if line.startswith("gitdir:"):
+            gitdir = Path(line.split(":", 1)[1].strip())
+            if not gitdir.is_absolute():
+                gitdir = (repo_dir / gitdir).resolve()
+            # gitdir is typically <repo>/.git/worktrees/<name>; mount <repo>/.git
+            parent_git = gitdir.parent.parent if gitdir.parent.name == "worktrees" else gitdir
+            if parent_git.is_dir():
+                return parent_git
+    except OSError:
+        pass
+    return None
+
+
 def _worktree_git_mount(cwd: Path) -> tuple[str, list[str]]:
-    """Detect if `cwd` is a git worktree whose `.git` file points to an external parent repo.
+    """Detect if `cwd` is a git worktree (or umbrella dir of worktrees) pointing to external parent repos.
 
     Returns `(container_workdir, extra_mounts)`:
-      - Regular directory / standalone repo: `("/work", ["-v", f"{cwd}:/work"])`
-      - Git worktree: mounts `cwd` at its exact host path AND mounts the parent repo's `.git`
+      - Regular directory / standalone repo: `("/work", ["-v", f"{cwd}:/work", "-w", "/work"])`
+      - Git worktree(s): mounts `cwd` at its exact host path AND mounts each parent repo's `.git`
         directory at its exact host path so `git status`/`commit`/`diff` work seamlessly inside
         the container without broken absolute `gitdir:` pointers.
     """
-    dot_git = cwd / ".git"
-    if dot_git.is_file():
-        try:
-            line = dot_git.read_text(encoding="utf-8", errors="replace").strip()
-            if line.startswith("gitdir:"):
-                gitdir = Path(line.split(":", 1)[1].strip())
-                if not gitdir.is_absolute():
-                    gitdir = (cwd / gitdir).resolve()
-                # gitdir is typically <repo>/.git/worktrees/<name>; mount <repo>/.git
-                parent_git = gitdir.parent.parent if gitdir.parent.name == "worktrees" else gitdir
-                if parent_git.is_dir():
-                    host_cwd = str(cwd.resolve())
-                    return host_cwd, [
-                        "-v",
-                        f"{host_cwd}:{host_cwd}",
-                        "-v",
-                        f"{parent_git}:{parent_git}",
-                        "-w",
-                        host_cwd,
-                    ]
-        except OSError:
-            pass
+    parent_gits: list[Path] = []
+    direct = _resolve_parent_git(cwd)
+    if direct is not None:
+        parent_gits.append(direct)
+    elif cwd.is_dir():
+        for child in sorted(cwd.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                pg = _resolve_parent_git(child)
+                if pg is not None and pg not in parent_gits:
+                    parent_gits.append(pg)
+    if parent_gits:
+        host_cwd = str(cwd.resolve())
+        mounts = ["-v", f"{host_cwd}:{host_cwd}"]
+        for pg in parent_gits:
+            mounts.extend(["-v", f"{pg}:{pg}"])
+        mounts.extend(["-w", host_cwd])
+        return host_cwd, mounts
     return "/work", ["-v", f"{cwd}:/work", "-w", "/work"]
 
 
@@ -168,8 +185,10 @@ class ClaudeAgent(AgentProvider):
         # On Linux rootless Docker, --user 0:0 maps to host UID 1000 so files created in
         # bind-mounted task dirs are owned cleanly by the host user.
         self.docker_user = docker_user
-        self.model = model or None
-        self.auditor_model = auditor_model or None
+        self.models = parse_model_list(model)
+        self.model = self.models[0] if self.models else None
+        self.auditor_models = parse_model_list(auditor_model) or list(self.models)
+        self.auditor_model = self.auditor_models[0] if self.auditor_models else None
         self.base_env = {
             k: v for k, v in (base_env or os.environ).items() if k not in BRIDGE_SECRET_KEYS
         }
@@ -507,65 +526,84 @@ class ClaudeAgent(AgentProvider):
             on_session_id(sid)
 
         log_path = log_dir / f"{sid}.jsonl"
-        effective_model = model_override or self.model
+        candidates = resolve_model_candidates(model_override, self.models)
+        last_res: AgentResult | None = None
 
-        if self.mode == "host":
-            cmd = self._build_host_cmd(sid, prompt, system_instructions, resume, model_override=effective_model)
-            env = {**self.base_env, "GIT_TERMINAL_PROMPT": "0", **env_extra}
-            log.info("task %s: running claude (host, %s) in %s", task.id, "resume" if resume else "new", cwd)
-            return self._run_streaming(
-                cmd=cmd,
-                cwd=cwd,
-                env=env,
-                timeout=timeout,
-                procs=procs,
-                on_progress=on_progress,
-                on_subtask=on_subtask,
-                log_path=log_path,
-                session_id=sid,
-                default_model=effective_model,
-            )
-
-        run_token = secrets.token_urlsafe(32)
-        container = f"kanban-task-{task.id}-{run_token[:8].lower()}"
-        with tempfile.TemporaryDirectory() as tmp:
-            cmd = self._build_docker_cmd(
-                task=task,
-                session_id=sid,
-                prompt=prompt,
-                system_instructions=system_instructions,
-                resume=resume,
-                cwd=cwd,
-                env_extra=env_extra,
-                run_token=run_token,
-                tmp_dir=Path(tmp),
-                container_name=container,
-                model_override=effective_model,
-            )
-            log.info(
-                "task %s: running claude (docker:%s, %s) in %s",
-                task.id,
-                container,
-                "resume" if resume else "new",
-                cwd,
-            )
-            register_proxy_token(run_token, task.id)
-            try:
-                return self._run_streaming(
+        for idx, effective_model in enumerate(candidates):
+            if self.mode == "host":
+                cmd = self._build_host_cmd(sid, prompt, system_instructions, resume, model_override=effective_model)
+                env = {**self.base_env, "GIT_TERMINAL_PROMPT": "0", **env_extra}
+                log.info("task %s: running claude (host, %s) in %s", task.id, "resume" if resume else "new", cwd)
+                res = self._run_streaming(
                     cmd=cmd,
                     cwd=cwd,
-                    env=self.base_env,
+                    env=env,
                     timeout=timeout,
                     procs=procs,
                     on_progress=on_progress,
                     on_subtask=on_subtask,
                     log_path=log_path,
-                    container=container,
                     session_id=sid,
                     default_model=effective_model,
                 )
-            finally:
-                unregister_proxy_token(run_token)
+            else:
+                run_token = secrets.token_urlsafe(32)
+                container = f"kanban-task-{task.id}-{run_token[:8].lower()}"
+                with tempfile.TemporaryDirectory() as tmp:
+                    cmd = self._build_docker_cmd(
+                        task=task,
+                        session_id=sid,
+                        prompt=prompt,
+                        system_instructions=system_instructions,
+                        resume=resume,
+                        cwd=cwd,
+                        env_extra=env_extra,
+                        run_token=run_token,
+                        tmp_dir=Path(tmp),
+                        container_name=container,
+                        model_override=effective_model,
+                    )
+                    log.info(
+                        "task %s: running claude (docker:%s, %s) in %s",
+                        task.id,
+                        container,
+                        "resume" if resume else "new",
+                        cwd,
+                    )
+                    register_proxy_token(run_token, task.id)
+                    try:
+                        res = self._run_streaming(
+                            cmd=cmd,
+                            cwd=cwd,
+                            env=self.base_env,
+                            timeout=timeout,
+                            procs=procs,
+                            on_progress=on_progress,
+                            on_subtask=on_subtask,
+                            log_path=log_path,
+                            container=container,
+                            session_id=sid,
+                            default_model=effective_model,
+                        )
+                    finally:
+                        unregister_proxy_token(run_token)
+            last_res = res
+            if (
+                res.is_error
+                and idx + 1 < len(candidates)
+                and is_model_fallback_error(res.text)
+            ):
+                next_model = candidates[idx + 1]
+                log.warning(
+                    "task %s: claude model %r failed; retrying with %r",
+                    task.id,
+                    effective_model or "default",
+                    next_model or "default",
+                )
+                continue
+            return res
+        assert last_res is not None
+        return last_res
 
     def run_audit(
         self,
@@ -576,7 +614,7 @@ class ClaudeAgent(AgentProvider):
         timeout: int,
         procs: set,
     ) -> str:
-        cmd = [
+        base_cmd = [
             self.claude_bin,
             "-p",
             "--output-format",
@@ -587,17 +625,37 @@ class ClaudeAgent(AgentProvider):
             "--append-system-prompt",
             auditor_prompt,
         ]
-        if self.auditor_model:
-            cmd += ["--model", self.auditor_model]
-        res = self._run_streaming(
-            cmd=cmd,
-            cwd=cwd,
-            env={**self.base_env, "GIT_TERMINAL_PROMPT": "0"},
-            timeout=timeout,
-            procs=procs,
-            stdin_text=dossier,
-        )
-        return res.text
+        candidates: list[str | None] = list(self.auditor_models) or [None]
+        last_res: AgentResult | None = None
+        for idx, audit_model in enumerate(candidates):
+            cmd = list(base_cmd)
+            if audit_model:
+                cmd += ["--model", audit_model]
+            res = self._run_streaming(
+                cmd=cmd,
+                cwd=cwd,
+                env={**self.base_env, "GIT_TERMINAL_PROMPT": "0"},
+                timeout=timeout,
+                procs=procs,
+                stdin_text=dossier,
+            )
+            last_res = res
+            if (
+                res.is_error
+                and idx + 1 < len(candidates)
+                and is_model_fallback_error(res.text)
+            ):
+                next_model = candidates[idx + 1]
+                log.warning(
+                    "task %s: claude auditor model %r failed; retrying with %r",
+                    task.id,
+                    audit_model or "default",
+                    next_model or "default",
+                )
+                continue
+            return res.text
+        assert last_res is not None
+        return last_res.text
 
     def agent_workdir(self, cwd: Path) -> Path:
         if self.mode == "docker":

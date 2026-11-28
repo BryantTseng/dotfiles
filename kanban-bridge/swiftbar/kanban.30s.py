@@ -63,7 +63,7 @@ def resolve_board(base_url: str, api_key: str, trigger_label: str) -> tuple[str,
     boards = (data.get("included") or {}).get("boards") or []
     if not boards:
         raise RuntimeError("No Planka boards found")
-    for preferred in (trigger_label.lower(), "agy"):
+    for preferred in ("general", "scratch", trigger_label.lower(), "agy"):
         for b in boards:
             if (b.get("name") or "").lower() == preferred:
                 return str(b["id"]), b.get("name") or str(b["id"])

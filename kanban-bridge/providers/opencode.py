@@ -36,6 +36,9 @@ from providers import (
     Task,
     UsageSummary,
     estimate_model_cost_usd,
+    is_model_fallback_error,
+    parse_model_list,
+    resolve_model_candidates,
 )
 
 log = logging.getLogger("bridge.opencode")
@@ -154,10 +157,13 @@ class OpenCodeAgent(AgentProvider):
         base_env: dict[str, str],
     ):
         self.opencode_bin = opencode_bin
-        self.model = model or None
+        self.models = parse_model_list(model)
+        self.model = self.models[0] if self.models else None
         self.agent_name = agent_name or None
-        self.auditor_model = auditor_model or model or None
-        self.worker_model = worker_model or None
+        self.auditor_models = parse_model_list(auditor_model) or list(self.models)
+        self.auditor_model = self.auditor_models[0] if self.auditor_models else None
+        worker_models = parse_model_list(worker_model)
+        self.worker_model = worker_models[0] if worker_models else None
         self.base_env = base_env
 
     @classmethod
@@ -456,35 +462,60 @@ class OpenCodeAgent(AgentProvider):
                 f"{prompt}"
             )
 
-        effective_model = model_override or self.model
-        cmd = self._build_cmd(
-            full_prompt,
-            session_id=session_id,
-            resume=resume,
-            model=effective_model,
-            agent_name=self.agent_name,
-        )
         env = {**self.base_env, "GIT_TERMINAL_PROMPT": "0", **env_extra}
         env.setdefault("OPENCODE_CONFIG_CONTENT", self._config_content(TASK_PERMISSION_CONFIG))
-        log.info(
-            "task %s: running opencode (%s) in %s",
-            task.id,
-            f"resume {session_id[:12]}" if resume and session_id else "new",
-            cwd,
-        )
-        return self._run_streaming(
-            cmd=cmd,
-            cwd=cwd,
-            env=env,
-            timeout=timeout,
-            procs=procs,
-            on_progress=on_progress,
-            on_session_id=on_session_id,
-            on_subtask=on_subtask,
-            log_dir=log_dir,
-            known_session_id=session_id if resume else None,
-            default_model=effective_model,
-        )
+        candidates = resolve_model_candidates(model_override, self.models)
+        attempt_session_id = session_id
+        attempt_resume = resume
+        last_res: AgentResult | None = None
+        for idx, effective_model in enumerate(candidates):
+            cmd = self._build_cmd(
+                full_prompt,
+                session_id=attempt_session_id,
+                resume=attempt_resume,
+                model=effective_model,
+                agent_name=self.agent_name,
+            )
+            log.info(
+                "task %s: running opencode (%s%s) in %s",
+                task.id,
+                f"resume {attempt_session_id[:12]}" if attempt_resume and attempt_session_id else "new",
+                f", model={effective_model}" if effective_model else "",
+                cwd,
+            )
+            res = self._run_streaming(
+                cmd=cmd,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                procs=procs,
+                on_progress=on_progress,
+                on_session_id=on_session_id,
+                on_subtask=on_subtask,
+                log_dir=log_dir,
+                known_session_id=attempt_session_id if attempt_resume else None,
+                default_model=effective_model,
+            )
+            last_res = res
+            if (
+                res.is_error
+                and idx + 1 < len(candidates)
+                and is_model_fallback_error(res.text)
+            ):
+                next_model = candidates[idx + 1]
+                log.warning(
+                    "task %s: opencode model %r failed; retrying with %r",
+                    task.id,
+                    effective_model or "default",
+                    next_model or "default",
+                )
+                if res.session_id and self.extract_tool_calls(res.session_id, log_dir):
+                    attempt_session_id = res.session_id
+                    attempt_resume = True
+                continue
+            return res
+        assert last_res is not None
+        return last_res
 
     def run_audit(
         self,
@@ -499,21 +530,40 @@ class OpenCodeAgent(AgentProvider):
             f"<auditor_instructions>\n{auditor_prompt}\n</auditor_instructions>\n\n"
             f"{dossier}"
         )
-        cmd = self._build_cmd(full_prompt, model=self.auditor_model)
         env = {
             **self.base_env,
             "GIT_TERMINAL_PROMPT": "0",
             "OPENCODE_CONFIG_CONTENT": self._config_content(AUDIT_PERMISSION_CONFIG),
         }
-        res = self._run_streaming(
-            cmd=cmd,
-            cwd=cwd,
-            env=env,
-            timeout=timeout,
-            procs=procs,
-            default_model=self.auditor_model,
-        )
-        return res.text
+        candidates: list[str | None] = list(self.auditor_models) or [None]
+        last_res: AgentResult | None = None
+        for idx, audit_model in enumerate(candidates):
+            cmd = self._build_cmd(full_prompt, model=audit_model)
+            res = self._run_streaming(
+                cmd=cmd,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                procs=procs,
+                default_model=audit_model,
+            )
+            last_res = res
+            if (
+                res.is_error
+                and idx + 1 < len(candidates)
+                and is_model_fallback_error(res.text)
+            ):
+                next_model = candidates[idx + 1]
+                log.warning(
+                    "task %s: opencode auditor model %r failed; retrying with %r",
+                    task.id,
+                    audit_model or "default",
+                    next_model or "default",
+                )
+                continue
+            return res.text
+        assert last_res is not None
+        return last_res.text
 
     def extract_tool_calls(self, session_id: str, log_dir: Path) -> list[str]:
         path = log_dir / f"{session_id}.jsonl"

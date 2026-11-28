@@ -3,7 +3,7 @@
 #   1. Logs in locally with your Planka admin credentials (password is not echoed).
 #   2. Mints your PLANKA_API_KEY via POST /api/users/<id>/api-key.
 #   3. Creates the "agy" bot user (boardUser, viewer + canComment) & mints PLANKA_BOT_API_KEY.
-#   4. Creates Project "Agy", Board "Agy", the 7 Kanban lists, and the "agy" trigger label.
+#   4. Creates Project "General", Board "General", the 8 Kanban lists, and default labels.
 #   5. Saves PLANKA_URL, PLANKA_API_KEY, PLANKA_BOT_API_KEY to ~/.config/kanban-bridge/env.
 set -euo pipefail
 
@@ -11,7 +11,7 @@ PLANKA_URL="${PLANKA_URL:-http://localhost:3000}"
 ENV_FILE="${HOME}/.config/kanban-bridge/env"
 BOT_USERNAME="${BOT_USERNAME:-agy}"
 TRIGGER_LABEL="${BRIDGE_TRIGGER_LABEL:-$BOT_USERNAME}"
-BOARD_TITLE="${PLANKA_BOARD_NAME:-$(printf '%s' "$BOT_USERNAME" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')}"
+BOARD_TITLE="${PLANKA_BOARD_NAME:-General}"
 
 read -rp "Planka admin email or username: " PLANKA_USER
 read -rsp "Planka admin password: " PLANKA_PASS

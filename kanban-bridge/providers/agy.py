@@ -36,6 +36,9 @@ from providers import (
     Task,
     UsageSummary,
     estimate_model_cost_usd,
+    is_model_fallback_error,
+    parse_model_list,
+    resolve_model_candidates,
 )
 
 log = logging.getLogger("bridge.agy")
@@ -99,9 +102,11 @@ class AgyAgent(AgentProvider):
         base_env: dict[str, str] | None = None,
     ):
         self.agy_bin = agy_bin
-        self.model = model or None
+        self.models = parse_model_list(model)
+        self.model = self.models[0] if self.models else None
         self.effort = effort or None
-        self.auditor_model = auditor_model or model or None
+        self.auditor_models = parse_model_list(auditor_model) or list(self.models)
+        self.auditor_model = self.auditor_models[0] if self.auditor_models else None
         self.disable_slash_commands = disable_slash_commands
         self.base_env = {
             k: v for k, v in (base_env or os.environ).items() if k not in BRIDGE_SECRET_KEYS
@@ -511,10 +516,9 @@ class AgyAgent(AgentProvider):
         # Build deduplicated model fallback chain so transient backend model-list
         # degradation (e.g. orchestrator model temporarily unrecognized) falls back
         # cleanly instead of failing the card.
-        model_candidates: list[str | None] = []
-        for candidate in (model_override, self.model, None):
-            if candidate not in model_candidates:
-                model_candidates.append(candidate)
+        model_candidates = resolve_model_candidates(
+            model_override, self.models, include_none=True
+        )
 
         env = {**self.base_env, "GIT_TERMINAL_PROMPT": "0", **env_extra}
         log.info(
@@ -576,7 +580,7 @@ class AgyAgent(AgentProvider):
         )
         # Read-only audit: --mode plan + --sandbox, NO --dangerously-skip-permissions.
         # Keep slash-command expansion enabled so --mode plan takes effect.
-        cmd = [
+        base_cmd = [
             self.agy_bin,
             "-p",
             full_prompt,
@@ -586,19 +590,38 @@ class AgyAgent(AgentProvider):
             "--mode",
             "plan",
         ]
-        if self.auditor_model:
-            cmd += ["--model", self.auditor_model]
-
         env = {**self.base_env, "GIT_TERMINAL_PROMPT": "0"}
-        res = self._run_streaming(
-            cmd=cmd,
-            cwd=cwd,
-            env=env,
-            timeout=timeout,
-            procs=procs,
-            log_dir=None,
-        )
-        return res.text
+        candidates: list[str | None] = list(self.auditor_models) or [None]
+        last_res: AgentResult | None = None
+        for idx, audit_model in enumerate(candidates):
+            cmd = list(base_cmd)
+            if audit_model:
+                cmd += ["--model", audit_model]
+            res = self._run_streaming(
+                cmd=cmd,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                procs=procs,
+                log_dir=None,
+            )
+            last_res = res
+            if (
+                res.is_error
+                and idx + 1 < len(candidates)
+                and is_model_fallback_error(res.text)
+            ):
+                next_model = candidates[idx + 1]
+                log.warning(
+                    "task %s: agy auditor model %r failed; retrying with %r",
+                    task.id,
+                    audit_model or "default",
+                    next_model or "default",
+                )
+                continue
+            return res.text
+        assert last_res is not None
+        return last_res.text
 
     def extract_tool_calls(self, session_id: str, log_dir: Path) -> list[str]:
         log_file = log_dir / f"{session_id}.jsonl"

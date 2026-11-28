@@ -635,6 +635,55 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
         assert human_ev is not None
         self.assertEqual(human_ev.task_id, "c1")
 
+    def test_planka_complete_checklists_filtered_and_all(self):
+        from providers.planka import PlankaBoard
+
+        board = PlankaBoard(
+            base_url="http://localhost:3000",
+            api_key="admin-key",
+            webhook_url="http://127.0.0.1:8787/planka",
+            webhook_secret="sec",
+            bot_api_key="bot-key",
+            bot_username="agy",
+        )
+        patched: list[tuple[str, dict, str | None]] = []
+
+        def fake_api(method: str, path: str, payload=None, *, api_key=None):
+            if method == "GET" and path == "/cards/c1":
+                return {
+                    "item": {"id": "c1", "boardId": "b1"},
+                    "included": {
+                        "taskLists": [
+                            {"id": "tl1", "name": "Subagents & Tasks"},
+                            {"id": "tl2", "name": "Implementation"},
+                        ],
+                        "tasks": [
+                            {"id": "t1", "taskListId": "tl1", "name": "[cmd] cargo test", "isCompleted": False},
+                            {"id": "t2", "taskListId": "tl1", "name": "[subagent] review", "isCompleted": True},
+                            {"id": "t3", "taskListId": "tl2", "name": "Open PR", "isCompleted": False},
+                        ],
+                    },
+                }
+            if method == "PATCH":
+                patched.append((path, payload, api_key))
+            return {"item": {}}
+
+        board._api = fake_api  # type: ignore[method-assign]
+        # Filtered: only Subagents & Tasks incomplete item (t1) is patched
+        self.assertEqual(board.complete_checklists("c1", {"Subagents & Tasks"}), 1)
+        self.assertEqual(patched, [("/tasks/t1", {"isCompleted": True}, "bot-key")])
+
+        # Unfiltered: both incomplete items (t1, t3) are patched; already-completed t2 is skipped
+        patched.clear()
+        self.assertEqual(board.complete_checklists("c1"), 2)
+        self.assertEqual(
+            patched,
+            [
+                ("/tasks/t1", {"isCompleted": True}, "bot-key"),
+                ("/tasks/t3", {"isCompleted": True}, "bot-key"),
+            ],
+        )
+
     def test_planka_upload_attachment_url_and_headers(self):
         import io
         from unittest import mock
@@ -1740,6 +1789,131 @@ class TestOpenCodeAgent(unittest.TestCase):
             m = SESSION_TAG_RE.search("Card body\n\n<!-- opencode-session:ses_or_123 -->")
             self.assertIsNotNone(m)
             self.assertEqual(m.group(1), "ses_or_123")
+
+
+class TestModelFallbackList(unittest.TestCase):
+    def test_parse_and_resolve_model_candidates(self):
+        from providers import is_model_fallback_error, parse_model_list, resolve_model_candidates
+
+        self.assertEqual(parse_model_list(None), [])
+        self.assertEqual(
+            parse_model_list(" openrouter/google/gemini-2.5-flash , , openrouter/anthropic/claude-haiku-5.5, openrouter/google/gemini-2.5-flash "),
+            ["openrouter/google/gemini-2.5-flash", "openrouter/anthropic/claude-haiku-5.5"],
+        )
+        self.assertEqual(
+            resolve_model_candidates("m_override, m1", ["m1", "m2"]),
+            ["m_override", "m1", "m2"],
+        )
+        self.assertEqual(
+            resolve_model_candidates(None, [], include_none=True),
+            [None],
+        )
+
+        self.assertTrue(is_model_fallback_error("429 RESOURCE_EXHAUSTED: Quota exceeded"))
+        self.assertTrue(is_model_fallback_error("OpenRouter: No allowed providers for this model"))
+        self.assertTrue(is_model_fallback_error("Rate limit exceeded"))
+        self.assertFalse(is_model_fallback_error("SyntaxError: unexpected EOF while parsing"))
+
+    def test_opencode_falls_back_on_quota_error_and_stops_on_non_model_error(self):
+        from unittest import mock
+        from providers import AgentResult
+        from providers.opencode import OpenCodeAgent
+
+        agent = OpenCodeAgent(
+            opencode_bin="opencode",
+            model="openrouter/google/gemini-2.5-flash, openrouter/anthropic/claude-haiku-5.5",
+            auditor_model="openrouter/google/gemini-2.5-pro, openrouter/z-ai/glm-5.3",
+            worker_model="openrouter/mistralai/devstral-2512, openrouter/google/gemini-2.5-flash",
+            base_env={},
+        )
+        self.assertEqual(agent.model, "openrouter/google/gemini-2.5-flash")
+        self.assertEqual(
+            agent.models,
+            ["openrouter/google/gemini-2.5-flash", "openrouter/anthropic/claude-haiku-5.5"],
+        )
+        self.assertEqual(agent.worker_model, "openrouter/mistralai/devstral-2512")
+
+        seen_models: list[str | None] = []
+
+        def fake_streaming(**kwargs):
+            m = kwargs.get("default_model")
+            seen_models.append(m)
+            if m == "openrouter/google/gemini-2.5-flash":
+                return AgentResult(
+                    text="⚠️ OpenCode ended with error:\n\n429 RESOURCE_EXHAUSTED: quota exceeded",
+                    is_error=True,
+                    model=m,
+                )
+            return AgentResult(text="done", session_id="ses_2", is_error=False, model=m)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Task(id="c1", title="Test")
+            with mock.patch.object(agent, "_run_streaming", side_effect=fake_streaming):
+                res = agent.run_task(
+                    task=t,
+                    session_id=None,
+                    prompt="hi",
+                    system_instructions="sys",
+                    resume=False,
+                    cwd=Path(tmp),
+                    env_extra={},
+                    on_progress=None,
+                    on_session_id=None,
+                    log_dir=Path(tmp),
+                    timeout=30,
+                    procs=set(),
+                )
+        self.assertFalse(res.is_error)
+        self.assertEqual(res.text, "done")
+        self.assertEqual(
+            seen_models,
+            ["openrouter/google/gemini-2.5-flash", "openrouter/anthropic/claude-haiku-5.5"],
+        )
+
+        # Non-model errors should NOT trigger fallback
+        seen_non_model: list[str | None] = []
+
+        def fake_non_model_err(**kwargs):
+            m = kwargs.get("default_model")
+            seen_non_model.append(m)
+            return AgentResult(text="⚠️ OpenCode failed: permission denied", is_error=True, model=m)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Task(id="c2", title="Test2")
+            with mock.patch.object(agent, "_run_streaming", side_effect=fake_non_model_err):
+                res2 = agent.run_task(
+                    task=t,
+                    session_id=None,
+                    prompt="hi",
+                    system_instructions="sys",
+                    resume=False,
+                    cwd=Path(tmp),
+                    env_extra={},
+                    on_progress=None,
+                    on_session_id=None,
+                    log_dir=Path(tmp),
+                    timeout=30,
+                    procs=set(),
+                )
+        self.assertTrue(res2.is_error)
+        self.assertEqual(seen_non_model, ["openrouter/google/gemini-2.5-flash"])
+
+        # Auditor fallback
+        seen_audit: list[str | None] = []
+
+        def fake_audit(**kwargs):
+            m = kwargs.get("default_model")
+            seen_audit.append(m)
+            if m == "openrouter/google/gemini-2.5-pro":
+                return AgentResult(text="429 rate limit exceeded", is_error=True, model=m)
+            return AgentResult(text="AUDIT_PASS", is_error=False, model=m)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Task(id="c3", title="Audit")
+            with mock.patch.object(agent, "_run_streaming", side_effect=fake_audit):
+                out = agent.run_audit(t, "audit", "dossier", Path(tmp), 30, set())
+        self.assertEqual(out, "AUDIT_PASS")
+        self.assertEqual(seen_audit, ["openrouter/google/gemini-2.5-pro", "openrouter/z-ai/glm-5.3"])
 
 
 if __name__ == "__main__":

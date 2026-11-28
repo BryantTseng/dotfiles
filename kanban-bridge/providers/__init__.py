@@ -142,6 +142,56 @@ class UsageSummary:
         return self.reported_cost_usd if self.reported_cost_usd is not None else self.estimated_cost_usd
 
 
+_MODEL_FALLBACK_ERROR_RE = re.compile(
+    r"(?:"
+    r"\b429\b|\b402\b|\b502\b|\b503\b"
+    r"|rate[-_ ]?limit|too many requests"
+    r"|quota|resource[-_ ]?exhausted|insufficient[-_ ]?quota|exceeded your current quota"
+    r"|insufficient credits?|out of credits?|credit balance|billing|payment required"
+    r"|overloaded|capacity|service unavailable|temporarily unavailable"
+    r"|provider returned error|no endpoints found|no allowed providers"
+    r"|invalid model(?: selection)?|model not found|model_not_found|not a valid model|unsupported model"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def parse_model_list(value: str | None) -> list[str]:
+    """Parse a comma-separated model list into a deduplicated, ordered list."""
+    if not value:
+        return []
+    out: list[str] = []
+    for part in str(value).split(","):
+        m = part.strip()
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def resolve_model_candidates(
+    model_override: str | None,
+    default_models: list[str],
+    *,
+    include_none: bool = False,
+) -> list[str | None]:
+    """Build an ordered, deduplicated list of model candidates to try."""
+    candidates: list[str | None] = []
+    for m in parse_model_list(model_override) + list(default_models):
+        if m and m not in candidates:
+            candidates.append(m)
+    if not candidates or include_none:
+        if None not in candidates:
+            candidates.append(None)
+    return candidates
+
+
+def is_model_fallback_error(text: str | None) -> bool:
+    """Return True when an agent error looks like quota/rate-limit/provider/model failure."""
+    if not text:
+        return False
+    return bool(_MODEL_FALLBACK_ERROR_RE.search(text))
+
+
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 PRICING_CACHE_TTL = 6 * 3600  # 6 hours
 _DATE_SUFFIX_RE = re.compile(r"-20\d{6}$")
@@ -393,6 +443,10 @@ class BoardProvider(ABC):
     def ensure_setup(self) -> None:
         """Idempotent startup/reconcile setup (sharing boards, registering webhooks, etc.)."""
 
+    def list_boards(self) -> list[dict[str, Any]]:
+        """Return metadata dicts for all boards (`id`, `name`, `url`, `columns`, `card_count`)."""
+        return []
+
     @abstractmethod
     def get_task(self, task_id: str) -> Task:
         """Fetch a single task/card by ID."""
@@ -466,6 +520,12 @@ class BoardProvider(ABC):
     def sync_checklist(self, task_id: str, list_name: str, items: list[tuple[str, bool]]) -> None:
         """Create or update a named checklist (`[(text, is_completed), ...]`) on a card."""
         return None
+
+    def complete_checklists(
+        self, task_id: str, list_names: set[str] | None = None
+    ) -> int:
+        """Mark incomplete items completed in matching checklists (or all checklists if None)."""
+        return 0
 
     def sync_attachments_in(
         self, task_id: str, dest_dir: Path, max_bytes: int = 25 * 1024 * 1024

@@ -71,7 +71,12 @@ impl Client {
     fn board(&self) -> Result<Board> {
         let projects = self.get("/projects")?;
         let boards = array(&projects["included"]["boards"]);
-        let wanted = [self.cfg.trigger_label.to_lowercase(), "agy".to_string()];
+        let wanted = [
+            "general".to_string(),
+            "scratch".to_string(),
+            self.cfg.trigger_label.to_lowercase(),
+            "agy".to_string(),
+        ];
         let chosen = wanted
             .iter()
             .find_map(|w| {

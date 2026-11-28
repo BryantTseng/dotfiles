@@ -71,7 +71,7 @@ class PlankaClient:
                 if str(b["id"]) == board_arg or (b.get("name") or "").lower() == board_arg.lower():
                     return str(b["id"]), b.get("name") or str(b["id"])
             raise SystemExit(f"Board not found: {board_arg!r}")
-        for preferred in (self.trigger_label.lower(), "agy"):
+        for preferred in ("general", "scratch", self.trigger_label.lower(), "agy"):
             for b in boards:
                 if (b.get("name") or "").lower() == preferred:
                     return str(b["id"]), b["name"]
@@ -91,6 +91,22 @@ def cmd_health(cli: PlankaClient, args) -> None:
         bridge_status = f"unreachable ({e})"
     print(f"Planka: ok ({cli.base_url}, user={me.get('username') or me.get('email')})")
     print(f"Bridge: {bridge_status}")
+
+
+def cmd_boards(cli: PlankaClient, args) -> None:
+    data = cli.req("GET", "/projects") or {}
+    boards = (data.get("included") or {}).get("boards") or []
+    if args.json:
+        print(json.dumps([
+            {"id": str(b["id"]), "name": b.get("name") or str(b["id"]), "url": f"{cli.base_url}/boards/{b['id']}"}
+            for b in boards
+        ], indent=2))
+        return
+    if not boards:
+        print("No Planka boards found.")
+        return
+    for b in boards:
+        print(f"- {b.get('name') or b['id']}  (id: {b['id']})  {cli.base_url}/boards/{b['id']}")
 
 
 def cmd_board(cli: PlankaClient, args) -> None:
@@ -234,7 +250,14 @@ def cmd_show(cli: PlankaClient, args) -> None:
 
 
 def cmd_create(cli: PlankaClient, args) -> None:
-    bid, _ = cli.resolve_board(args.board)
+    board_arg = args.board
+    if not board_arg and args.repo:
+        # If a board matching --repo exists, route the card there automatically
+        data = cli.req("GET", "/projects") or {}
+        boards = (data.get("included") or {}).get("boards") or []
+        if any((b.get("name") or "").lower() == args.repo.strip().lower() for b in boards):
+            board_arg = args.repo.strip()
+    bid, _ = cli.resolve_board(board_arg)
     inc = cli.board_bundle(bid).get("included") or {}
     lists = [l for l in (inc.get("lists") or []) if l.get("type") in ("active", "closed") and l.get("name")]
     target = args.list.strip().lower()
@@ -454,10 +477,13 @@ def cmd_checklist(cli: PlankaClient, args) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Safe CLI for operating the local Planka kanban board.")
-    p.add_argument("--board", help="Board ID or name (defaults to BRIDGE_TRIGGER_LABEL, else 'Agy')")
+    p.add_argument("--board", help="Board ID or name (defaults to 'General')")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("health", help="Check Planka API and bridge /health")
+
+    p_boards = sub.add_parser("boards", help="List all Planka boards")
+    p_boards.add_argument("--json", action="store_true")
 
     p_board = sub.add_parser("board", help="List columns and cards")
     p_board.add_argument("--json", action="store_true")
@@ -514,6 +540,7 @@ def main() -> None:
     cli = PlankaClient(load_env())
     {
         "health": cmd_health,
+        "boards": cmd_boards,
         "board": cmd_board,
         "show": cmd_show,
         "create": cmd_create,

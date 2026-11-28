@@ -54,8 +54,30 @@ from providers import (
     load_agent_provider,
     load_board_provider,
 )
+from report_ui import (
+    extract_questions,
+    format_planka_summary,
+    format_qa_reply,
+    load_report,
+    render_report_page,
+    report_link,
+    save_report,
+    verify_report_sig,
+)
+from ui import (
+    DASHBOARD_HTML,
+    get_pricing_overview,
+    list_agy_models,
+    list_pricing_models,
+    list_recent_logs,
+    read_editable_settings,
+    read_log_tail,
+    update_env_file,
+)
 
 ENV = dict(os.environ)
+ENV_FILE_PATH = Path(ENV.get("BRIDGE_ENV_FILE", "~/.config/kanban-bridge/env")).expanduser()
+START_TIME = time.time()
 
 BOARD_NAME = ENV.get("BRIDGE_BOARD_PROVIDER", "planka")
 AGENT_NAME = ENV.get("BRIDGE_AGENT_PROVIDER", "agy")
@@ -65,6 +87,7 @@ PORT = int(ENV.get("BRIDGE_PORT", "8787"))
 TASKS_ROOT = Path(ENV.get("BRIDGE_TASKS_ROOT", "~/workspace/kanban-tasks")).expanduser()
 STATE_ROOT = Path(ENV.get("BRIDGE_STATE_ROOT", "~/.local/share/kanban-bridge")).expanduser()
 LOGS_DIR = STATE_ROOT / "logs"
+REPORTS_DIR = STATE_ROOT / "reports"
 
 RUN_TIMEOUT = int(ENV.get("BRIDGE_RUN_TIMEOUT", "3600"))
 MAX_CONCURRENT = int(ENV.get("BRIDGE_MAX_CONCURRENT", "2"))
@@ -121,7 +144,7 @@ _repo_locks_guard = threading.Lock()
 
 
 def discover_repos() -> dict[str, Path]:
-    """Return available git repos under REPOS_ROOT plus any explicit BRIDGE_REPOS."""
+    """Return available single git repos under REPOS_ROOT plus any explicit BRIDGE_REPOS."""
     out: dict[str, Path] = {}
     if REPOS_ROOT.is_dir():
         for child in sorted(REPOS_ROOT.iterdir()):
@@ -130,6 +153,43 @@ def discover_repos() -> dict[str, Path]:
             if child.is_dir() and (child / ".git").exists():
                 out[child.name.lower()] = child.resolve()
     out.update(EXPLICIT_REPOS)
+    return out
+
+
+def discover_workdirs() -> dict[str, list[tuple[str, Path]]]:
+    """Return board-name -> list of `(repo_name, repo_path)` under REPOS_ROOT / BRIDGE_REPOS.
+
+    Supports both:
+      - Single-repo directory: `REPOS_ROOT/<name>/.git` -> `[(name, path)]`
+      - Multi-repo workspace directory: `REPOS_ROOT/<name>/<subrepo>/.git` -> `[(sub1, path1), ...]`
+    """
+    out: dict[str, list[tuple[str, Path]]] = {}
+    if REPOS_ROOT.is_dir():
+        for child in sorted(REPOS_ROOT.iterdir()):
+            if child.name.startswith(".") or not child.is_dir():
+                continue
+            key = child.name.lower()
+            if (child / ".git").exists():
+                out[key] = [(key, child.resolve())]
+            else:
+                subs = [
+                    (sub.name.lower(), sub.resolve())
+                    for sub in sorted(child.iterdir())
+                    if not sub.name.startswith(".") and sub.is_dir() and (sub / ".git").exists()
+                ]
+                if subs:
+                    out[key] = subs
+    for name, p in EXPLICIT_REPOS.items():
+        if (p / ".git").exists():
+            out[name] = [(name, p)]
+        elif p.is_dir():
+            subs = [
+                (sub.name.lower(), sub.resolve())
+                for sub in sorted(p.iterdir())
+                if not sub.name.startswith(".") and sub.is_dir() and (sub / ".git").exists()
+            ]
+            if subs:
+                out[name] = subs
     return out
 
 
@@ -173,6 +233,20 @@ RUN_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT)
 SHUTDOWN = threading.Event()
 FORCE = threading.Event()
 EXIT_RELOAD = 3  # tells run.sh to restart the bridge (code changed)
+SHUTDOWN_STATE = {"reason": "stop", "last_signal": 0.0}
+
+
+def request_service_action(action: str) -> str:
+    """Trigger graceful drain + exit 3 (restart) or exit 0 (stop)."""
+    if action == "restart":
+        SHUTDOWN_STATE["reason"] = "reload"
+        SHUTDOWN.set()
+        return "Restarting kanban-bridge after active runs finish..."
+    if action == "stop":
+        SHUTDOWN_STATE["reason"] = "stop"
+        SHUTDOWN.set()
+        return "Stopping kanban-bridge after active runs finish..."
+    raise ValueError(f"Unsupported service action: {action!r}")
 
 _active: dict[str, str] = {}  # task id -> "run" / "audit"
 _active_lock = threading.Lock()
@@ -291,14 +365,61 @@ def resolve_repo(task: Task) -> tuple[str | None, Path | None]:
     return None, None
 
 
+def resolve_workdir(task: Task) -> tuple[str | None, list[tuple[str, Path]]]:
+    """Match a card to a workdir (1 or more git repos) via board name or `repo:` label.
+
+    Cards on the general board (any named board not matching a directory under
+    REPOS_ROOT / BRIDGE_REPOS) always run as empty scratch tasks.
+    """
+    lower_labels = {l.strip().lower() for l in task.label_titles}
+    if SCRATCH_LABEL in lower_labels:
+        return None, []
+    workdirs = discover_workdirs()
+    board_key = (task.project_name or "").strip().lower()
+    if board_key:
+        if board_key in workdirs:
+            return board_key, workdirs[board_key]
+        return None, []
+    repos = discover_repos()
+    for lbl in task.label_titles:
+        raw = lbl.strip()
+        low = raw.lower()
+        if low.startswith(REPO_LABEL_PREFIX):
+            val = raw[len(REPO_LABEL_PREFIX):].strip()
+            key = val.lower()
+            if key in workdirs:
+                return key, workdirs[key]
+            if key in repos:
+                return key, [(key, repos[key])]
+            p = Path(val).expanduser().resolve()
+            if p.is_dir() and (p / ".git").exists():
+                return p.name.lower(), [(p.name.lower(), p)]
+            raise RuntimeError(
+                f"Card requests `repo:{val}`, which was not found under {REPOS_ROOT} or BRIDGE_REPOS "
+                f"(available: {', '.join(sorted(workdirs)) or 'none'})."
+            )
+    return None, []
+
+
 def workspace_mode_of(task: Task) -> str | None:
-    """Return 'scratch', 'worktree', 'in-place', or None if not yet chosen."""
+    """Return 'scratch', 'worktree', 'in-place', or None if not yet chosen.
+
+    Cards on a non-workdir (general) board always use 'scratch'. On workdir
+    boards, explicit labels take precedence and default to 'worktree'.
+    """
     low = {l.strip().lower() for l in task.label_titles}
+    board_key = (task.project_name or "").strip().lower()
+    if board_key and board_key not in discover_workdirs():
+        return SCRATCH_LABEL
     if SCRATCH_LABEL in low:
         return SCRATCH_LABEL
     if INPLACE_LABEL in low:
         return INPLACE_LABEL
     if WORKTREE_LABEL in low:
+        return WORKTREE_LABEL
+    if any(l.startswith(REPO_LABEL_PREFIX) for l in low):
+        return WORKTREE_LABEL
+    if board_key:
         return WORKTREE_LABEL
     return None
 
@@ -321,13 +442,13 @@ def needs_intake(task: Task) -> bool:
     mode = execution_mode_of(task)
     if mode is None or ws is None:
         return True
-    # If worktree/in-place was picked, a repo must also be selected
+    # If worktree/in-place was picked, a repo or workdir must also be selected
     if ws in (WORKTREE_LABEL, INPLACE_LABEL):
         try:
-            rname, _ = resolve_repo(task)
+            wname, wrepos = resolve_workdir(task)
         except RuntimeError:
             return True
-        if not rname:
+        if not wname or not wrepos:
             return True
     return False
 
@@ -346,18 +467,45 @@ def _default_base_ref(repo_path: Path) -> str:
     return "HEAD"
 
 
+def _ensure_git_worktree(repo_path: Path, wt: Path, branch: str, lock_key: str) -> tuple[str, str]:
+    """Create or reuse a git worktree at `wt` for `repo_path`. Returns `(branch, base_ref)`."""
+    if not (repo_path / ".git").exists():
+        raise RuntimeError(f"Configured repo `{repo_path.name}` is not a git repo: {repo_path}")
+    with _repo_lock(lock_key):
+        if wt.exists() and (wt / ".git").exists():
+            cur_branch = git(wt, "rev-parse", "--abbrev-ref", "HEAD") or branch
+            return cur_branch, _default_base_ref(repo_path)
+        subprocess.run(
+            ["git", "-C", str(repo_path), "fetch", "--prune", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        base_ref = _default_base_ref(repo_path)
+        if git(repo_path, "rev-parse", "-q", "--verify", f"refs/heads/{branch}"):
+            cmd = ["git", "-C", str(repo_path), "worktree", "add", str(wt), branch]
+        else:
+            cmd = ["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(wt), base_ref]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"git worktree add failed for {repo_path.name}: {res.stderr.strip() or res.stdout.strip()}")
+        log.info("created worktree %s on branch %s (base %s)", wt, branch, base_ref)
+        return branch, base_ref
+
+
 def ensure_task_workspace(task: Task) -> tuple[Path, dict | None]:
     """Return `(cwd, repo_ctx)`.
 
-    - `repo:<name>` + `in-place`: runs directly inside `~/workspace/<repo>` on its current branch.
-    - `repo:<name>` (+ `worktree` or default): creates/reuses an isolated `git worktree` on branch
-      `kanban/<id-tail>-<slug>` off the repo's default branch.
-    - `scratch` (or no repo): creates/reuses a standalone scratch git repo in `TASKS_ROOT`.
+    - Single repo (`repos/<name>/.git`): creates/reuses an isolated `git worktree` (or `in-place`).
+    - Multi-repo workdir (`repos/<name>/<subrepo>/.git`): creates/reuses an umbrella directory
+      containing one `git worktree` per sub-repo on branch `kanban/<id-tail>-<slug>`.
+    - `scratch` (or no matching workdir): creates/reuses a standalone scratch git repo in `TASKS_ROOT`.
     """
     slug = _slug(task.title)
     ws_mode = workspace_mode_of(task)
-    repo_name, repo_path = resolve_repo(task)
-    if repo_name and repo_path:
+    workdir_name, repo_list = resolve_workdir(task)
+    if workdir_name and len(repo_list) == 1:
+        repo_name, repo_path = repo_list[0]
         if not (repo_path / ".git").exists():
             raise RuntimeError(f"Configured repo `{repo_name}` is not a git repo: {repo_path}")
         if ws_mode == INPLACE_LABEL:
@@ -370,45 +518,68 @@ def ensure_task_workspace(task: Task) -> tuple[Path, dict | None]:
                 "base_ref": base_ref,
                 "mode": INPLACE_LABEL,
             }
-        with _repo_lock(repo_name):
-            existing = sorted(TASKS_ROOT.glob(f"{repo_name}-task-{task.id}-*"))
-            if existing and (existing[0] / ".git").exists():
-                wt = existing[0]
-                branch = git(wt, "rev-parse", "--abbrev-ref", "HEAD") or f"kanban/{task.id[-6:]}-{slug}"
-                base_ref = _default_base_ref(repo_path)
-                return wt, {
-                    "name": repo_name,
-                    "repo_path": repo_path,
+        existing = sorted(TASKS_ROOT.glob(f"{workdir_name}-task-{task.id}-*"))
+        short_id = task.id[-6:] if len(task.id) > 6 else task.id
+        default_branch = f"kanban/{short_id}-{slug}"
+        wt = existing[0] if existing and (existing[0] / ".git").exists() else TASKS_ROOT / f"{workdir_name}-task-{task.id}-{slug}"
+        branch, base_ref = _ensure_git_worktree(repo_path, wt, default_branch, repo_name)
+        return wt, {
+            "name": repo_name,
+            "repo_path": repo_path,
+            "branch": branch,
+            "base_ref": base_ref,
+            "mode": WORKTREE_LABEL,
+        }
+
+    if workdir_name and len(repo_list) > 1:
+        short_id = task.id[-6:] if len(task.id) > 6 else task.id
+        default_branch = f"kanban/{short_id}-{slug}"
+        if ws_mode == INPLACE_LABEL:
+            parent_dir = repo_list[0][1].parent
+            sub_ctxs = [
+                {
+                    "name": sname,
+                    "repo_path": spath,
+                    "worktree": spath,
+                    "branch": git(spath, "rev-parse", "--abbrev-ref", "HEAD") or "HEAD",
+                    "base_ref": _default_base_ref(spath),
+                }
+                for sname, spath in repo_list
+            ]
+            return parent_dir, {
+                "name": workdir_name,
+                "repo_path": parent_dir,
+                "branch": sub_ctxs[0]["branch"],
+                "base_ref": sub_ctxs[0]["base_ref"],
+                "mode": INPLACE_LABEL,
+                "multi_repo": True,
+                "repos": sub_ctxs,
+            }
+        existing = sorted(TASKS_ROOT.glob(f"{workdir_name}-task-{task.id}-*"))
+        umbrella = existing[0] if existing and existing[0].is_dir() else TASKS_ROOT / f"{workdir_name}-task-{task.id}-{slug}"
+        umbrella.mkdir(parents=True, exist_ok=True)
+        sub_ctxs = []
+        for sname, spath in repo_list:
+            wt = umbrella / sname
+            branch, base_ref = _ensure_git_worktree(spath, wt, default_branch, f"{workdir_name}/{sname}")
+            sub_ctxs.append(
+                {
+                    "name": sname,
+                    "repo_path": spath,
+                    "worktree": wt,
                     "branch": branch,
                     "base_ref": base_ref,
-                    "mode": WORKTREE_LABEL,
                 }
-
-            subprocess.run(
-                ["git", "-C", str(repo_path), "fetch", "--prune", "origin"],
-                capture_output=True,
-                text=True,
-                timeout=30,
             )
-            base_ref = _default_base_ref(repo_path)
-            short_id = task.id[-6:] if len(task.id) > 6 else task.id
-            branch = f"kanban/{short_id}-{slug}"
-            wt = TASKS_ROOT / f"{repo_name}-task-{task.id}-{slug}"
-            if git(repo_path, "rev-parse", "-q", "--verify", f"refs/heads/{branch}"):
-                cmd = ["git", "-C", str(repo_path), "worktree", "add", str(wt), branch]
-            else:
-                cmd = ["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(wt), base_ref]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode != 0:
-                raise RuntimeError(f"git worktree add failed: {res.stderr.strip() or res.stdout.strip()}")
-            log.info("task %s: created worktree %s on branch %s (base %s)", task.id, wt, branch, base_ref)
-            return wt, {
-                "name": repo_name,
-                "repo_path": repo_path,
-                "branch": branch,
-                "base_ref": base_ref,
-                "mode": WORKTREE_LABEL,
-            }
+        return umbrella, {
+            "name": workdir_name,
+            "repo_path": repo_list[0][1].parent,
+            "branch": default_branch,
+            "base_ref": sub_ctxs[0]["base_ref"],
+            "mode": WORKTREE_LABEL,
+            "multi_repo": True,
+            "repos": sub_ctxs,
+        }
 
     existing = sorted(TASKS_ROOT.glob(f"task-{task.id}-*"))
     d = existing[0] if existing else TASKS_ROOT / f"task-{task.id}-{slug}"
@@ -491,7 +662,17 @@ def system_prompt(
     ]
 
     if repo_ctx:
-        if repo_ctx.get("mode") == INPLACE_LABEL:
+        if repo_ctx.get("multi_repo"):
+            sub_desc = ", ".join(
+                f"`{r['name']}` (branch `{r['branch']}`, base `{r['base_ref']}`)"
+                for r in repo_ctx.get("repos") or []
+            )
+            loc_line = (
+                f"You are working inside multi-repo workspace `{repo_ctx['name']}` at `{view_cwd}` "
+                f"containing `{repo_ctx['mode']}` repositories: {sub_desc}. "
+                "Make commits inside each modified repository subdirectory rather than the parent folder. "
+            )
+        elif repo_ctx.get("mode") == INPLACE_LABEL:
             loc_line = (
                 f"You are working **in-place** inside repository `{repo_ctx['name']}` at `{view_cwd}` "
                 f"(current branch: `{repo_ctx['branch']}`). Do NOT discard unrelated uncommitted user "
@@ -526,10 +707,17 @@ def system_prompt(
         parts.append(
             "**PLAN-FIRST / SPEC-ONLY MODE IS ACTIVE:**\n"
             "- Do NOT modify production code yet.\n"
-            "- Inspect the codebase thoroughly, outline the recommended approach (and key alternatives/tradeoffs), "
-            "write or update a design spec doc if helpful, and ask any clarifying decisions as a concise "
-            "numbered list.\n"
-            "- Wait for the user to answer your questions or reply `do it` / `proceed` before implementing.\n"
+            "- Inspect the codebase thoroughly, then write a concise, easy-to-read report: start with `## TL;DR`, "
+            "use a compact Markdown table (`Component / File | Proposed Change | Why`) instead of long prose, and "
+            "include a small `mermaid` diagram when data/control flow is clearer visually (keep it token-efficient).\n"
+            "- If you have decisions or clarifying questions for the user, emit a `QUESTIONS:` block before `STATUS:` "
+            "(the bridge renders this as an interactive form alongside your report):\n"
+            "QUESTIONS:\n"
+            "1. Short question?\n"
+            "   - Recommended option [recommended]\n"
+            "   - Alternative option\n"
+            "(Add `[multi]` on a question for multi-select, or omit options for free-text input.)\n"
+            "- Wait for the user to answer or reply `do it` / `proceed` before implementing.\n"
             "- End this turn with `STATUS: NEEDS_INPUT`."
         )
 
@@ -576,6 +764,16 @@ def system_prompt(
         "save/generate it and add one `ATTACH:` line per file before the status line using a path relative to your working directory:\n"
         "ATTACH: <relative-path>\n"
         "(or `ATTACH: <relative-path> | <display name>`). The bridge uploads those files directly to the card as attachments."
+    )
+
+    parts.append(
+        "Report formatting (keep token usage lean):\n"
+        "- Format your final response as an easy-to-read report: start with a 2–3 sentence `## TL;DR`, "
+        "use compact Markdown tables for changes (`File / Area | Summary`) and verification (`Check | Result`), "
+        "and use a small `mermaid` diagram or `ATTACH:` image only when it genuinely clarifies architecture/flow "
+        "(don't pad with verbose prose or unnecessary visuals).\n"
+        "- Whenever ending with `STATUS: NEEDS_INPUT` to ask the user decisions, you may use a `QUESTIONS:` block "
+        "(numbered questions with indented `- Option [recommended]` choices) so the bridge presents a clickable Q&A form."
     )
 
     parts.append(
@@ -920,19 +1118,32 @@ def request_still_open(task_id: str, request_comment_id: str) -> bool:
     return ACCESS_REQUEST_HEAD in comments[-1].body_text
 
 
-def access_page(title: str, body: str, button: str | None = None) -> str:
+def access_page(
+    title: str,
+    body: str,
+    button: str | None = None,
+    auto_close_url: str | None = None,
+) -> str:
     form = (
         f'<form method="post"><button type="submit">{html.escape(button)}</button></form>'
         if button
         else ""
     )
+    script = ""
+    if auto_close_url:
+        script = (
+            "<script>setTimeout(() => {"
+            " try { window.close(); } catch (_) {}"
+            f" setTimeout(() => {{ if (!window.closed) location.replace({json.dumps(auto_close_url)}); }}, 250);"
+            "}, 350);</script>"
+        )
     return f"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>{html.escape(title)}</title>
 <style>body{{font:16px system-ui;background:#1e2230;color:#e6e6e6;display:grid;place-items:center;
 min-height:90vh;margin:0}}main{{max-width:28rem;padding:2rem;background:#272c3b;border-radius:12px}}
 button{{font:inherit;padding:.6rem 1.2rem;border:0;border-radius:8px;background:#4f7cff;color:#fff;
 cursor:pointer}}a{{color:#8fb0ff}}code{{background:#11141c;padding:.1rem .3rem;border-radius:4px}}</style>
-<main><h2>{html.escape(title)}</h2>{body}{form}</main>"""
+<main><h2>{html.escape(title)}</h2>{body}{form}</main>{script}"""
 
 
 def handle_access_click(method: str, query: str) -> tuple[int, str]:
@@ -968,7 +1179,8 @@ def handle_access_click(method: str, query: str) -> tuple[int, str]:
     done = "Approved" if action == "approve" else "Denied"
     return 200, access_page(
         f"{done}: {', '.join(items)}",
-        "<p>The agent will continue shortly. You can close this tab.</p>" + back,
+        "<p>The agent will continue shortly. Returning to card…</p>" + back,
+        auto_close_url=BOARD.task_url(task_id),
     )
 
 
@@ -994,14 +1206,29 @@ def setup_link(task_id: str) -> str:
 
 
 def intake_comment_text(task: Task) -> str:
+    board_name = (task.project_name or "").strip()
+    target_hint = ""
+    if board_name:
+        workdirs = discover_workdirs()
+        bkey = board_name.lower()
+        if bkey in workdirs:
+            subs = workdirs[bkey]
+            if len(subs) == 1:
+                target_hint = f"- **Board Target:** `{board_name}` → repo `{bkey}` (`worktree`)\n"
+            else:
+                names = ", ".join(f"`{n}`" for n, _ in subs)
+                target_hint = f"- **Board Target:** `{board_name}` → workdir `{bkey}` ({names}, `worktree`)\n"
+        else:
+            target_hint = f"- **Board Target:** `{board_name}` → standalone `scratch` folder\n"
     return (
         f"### {INTAKE_HEAD}\n\n"
-        f"Choose workspace & execution mode before `{AGENT.name}` starts (0 tokens used):\n\n"
+        f"Choose execution mode before `{AGENT.name}` starts (0 tokens used):\n\n"
         f"👉 **[⚙️ Configure & Start]({setup_link(task.id)})**\n\n"
-        "- **Target:** standalone `scratch` folder *(for new/unrelated tasks)*, or an existing repo with `worktree` *(isolated branch)* / `in-place`\n"
+        f"{target_hint}"
+        "- **Target (override if needed):** `scratch`, or `<repo>` with `worktree` / `in-place`\n"
         "- **Mode:** `plan-first` *(spec & numbered Q&A before coding)* or `direct` *(implement right away)*\n"
         f"- **Optional:** `{ORCHESTRATOR_LABEL}` *(act as coordinator; delegate coding & review to subagents)*\n\n"
-        "*or reply with keywords like `scratch plan-first`, `<repo> worktree direct orchestrator`, or attach labels on this card*"
+        "*or reply with keywords like `plan-first`, `direct orchestrator`, or attach labels on this card*"
     )
 
 
@@ -1258,7 +1485,8 @@ def handle_setup_click(method: str, query: str, post_body: bytes = b"") -> tuple
     enqueue(task_id)
     return 200, access_page(
         f"Configured: {summary}",
-        f"<p>{html.escape(AGENT.name.capitalize())} is starting now. You can close this tab.</p>" + back,
+        f"<p>{html.escape(AGENT.name.capitalize())} is starting now. Returning to card…</p>" + back,
+        auto_close_url=BOARD.task_url(task_id),
     )
 
 
@@ -1685,7 +1913,22 @@ def run_task(
             )
 
         if cwd is not None:
-            if repo_ctx:
+            if repo_ctx and repo_ctx.get("multi_repo"):
+                sub_parts: list[str] = []
+                for r in repo_ctx.get("repos") or []:
+                    wt = r["worktree"]
+                    br = git(wt, "rev-parse", "--abbrev-ref", "HEAD") or r["branch"]
+                    hd = git(wt, "rev-parse", "--short", "HEAD")
+                    dirty = bool(git(wt, "status", "--porcelain"))
+                    base_hd = git(wt, "rev-parse", "--short", r["base_ref"])
+                    if dirty or (hd and base_hd and hd != base_hd):
+                        tag = f"`{r['name']}` (`{br}`" + (f" · `{hd}`" if hd else "") + (", dirty" if dirty else "") + ")"
+                        sub_parts.append(tag)
+                if sub_parts:
+                    git_footer = f"workdir `{repo_ctx['name']}` · " + " · ".join(sub_parts)
+                else:
+                    git_footer = f"workdir `{repo_ctx['name']}` · branch `{repo_ctx['branch']}`"
+            elif repo_ctx:
                 branch = git(cwd, "rev-parse", "--abbrev-ref", "HEAD") or repo_ctx["branch"]
                 head = git(cwd, "rev-parse", "--short", "HEAD")
                 dirty = bool(git(cwd, "status", "--porcelain"))
@@ -1715,6 +1958,7 @@ def run_task(
         return
 
     requested: list[str] = []
+    access_footer = ""
     m = ACCESS_REQUEST_RE.search(reply)
     if m:
         items, errors = [], []
@@ -1725,9 +1969,9 @@ def run_task(
         if items:
             status = "NEEDS_INPUT"
             requested = items
-            reply += access_request_block(task_id, placeholder.id, items)
+            access_footer += access_request_block(task_id, placeholder.id, items)
         if errors:
-            reply += "\n\n_Requests the bridge can't grant: " + "; ".join(errors) + "_"
+            access_footer += "\n\n_Requests the bridge can't grant: " + "; ".join(errors) + "_"
 
     reply, checklists = extract_checklists(reply)
     for cl_name, cl_items in checklists:
@@ -1738,6 +1982,8 @@ def run_task(
             log.exception("task %s: syncing checklist %r failed", task_id, cl_name)
 
     reply, attach_specs = extract_attachments(reply)
+    uploaded_atts: list[dict[str, Any]] = []
+    attach_footer = ""
     if attach_specs and cwd is not None:
         uploaded_names: list[str] = []
         attach_errors: list[str] = []
@@ -1753,20 +1999,63 @@ def run_task(
                 att = BOARD.upload_attachment(task_id, resolved, name=disp_name)
                 if att:
                     uploaded_names.append(att.name)
+                    uploaded_atts.append(
+                        {"name": att.name, "url": att.url, "is_image": att.is_image}
+                    )
                     log.info("task %s: uploaded attachment %r (%s)", task_id, att.name, resolved)
             except Exception as e:
                 log.exception("task %s: uploading attachment %s failed", task_id, resolved)
                 attach_errors.append(f"`{resolved.name}`: upload failed ({e})")
         if uploaded_names:
-            reply += "\n\n📎 Attached to card: " + ", ".join(f"`{n}`" for n in uploaded_names)
+            attach_footer += "\n\n📎 Attached to card: " + ", ".join(f"`{n}`" for n in uploaded_names)
         if attach_errors:
-            reply += "\n\n⚠️ Could not attach: " + "; ".join(attach_errors)
+            attach_footer += "\n\n⚠️ Could not attach: " + "; ".join(attach_errors)
 
+    reply, questions = extract_questions(reply)
+    mode_label = (
+        "plan-first" if plan_only else ("orchestrator" if is_orchestrator(task) else "direct")
+    )
+    report_url = ""
+    try:
+        save_report(
+            REPORTS_DIR,
+            {
+                "task_id": task_id,
+                "comment_id": placeholder.id,
+                "title": task.title,
+                "status": status,
+                "mode": mode_label,
+                "agent_name": AGENT.name,
+                "model": getattr(result, "model", "") if "result" in locals() else "",
+                "git_footer": git_footer,
+                "raw_markdown": reply,
+                "questions": questions,
+                "attachments": uploaded_atts,
+            },
+        )
+        report_url = report_link(APPROVAL_BASE, SECRET, task_id, placeholder.id)
+    except Exception:
+        log.exception("task %s: saving report failed", task_id)
+
+    planka_reply = (
+        format_planka_summary(reply, questions, report_url, status)
+        if report_url
+        else reply
+    )
+    if access_footer:
+        planka_reply += access_footer
+    if attach_footer:
+        planka_reply += attach_footer
     if git_footer:
-        reply += f"\n\n*{git_footer}*"
-    BOARD.publish(task_id, placeholder.id, reply)
+        planka_reply += f"\n\n*{git_footer}*"
+    BOARD.publish(task_id, placeholder.id, planka_reply)
+    reply = planka_reply
 
     if status == "DONE":
+        try:
+            BOARD.complete_checklists(task_id, {"Subagents & Tasks"})
+        except Exception:
+            log.warning("task %s: completing Subagents & Tasks checklist failed", task_id, exc_info=True)
         # Never auto-move to Done: park in Pending for user review/deployment/manual close.
         if not BOARD.move_to(task, BUCKET_PENDING):
             BOARD.move_to(task, BUCKET_NEEDS_ACTION)
@@ -1857,12 +2146,44 @@ def build_dossier(
     ]
     calls = AGENT.extract_tool_calls(session_id, LOGS_DIR)
     subagents = AGENT.extract_subagent_audits(session_id, LOGS_DIR, task_id=task.id)
-    base = audit_base(cwd, repo_ctx=repo_ctx)
-    diff = git(cwd, "diff", base, "HEAD")
-    if repo_ctx:
+    if repo_ctx and repo_ctx.get("multi_repo"):
+        diff_chunks: list[str] = []
+        commit_chunks: list[str] = []
+        file_list: list[str] = []
+        repo_summaries: list[str] = []
+        for r in repo_ctx.get("repos") or []:
+            wt = r["worktree"]
+            rname = r["name"]
+            rbase = audit_base(wt, repo_ctx=r)
+            rdiff = git(wt, "diff", rbase, "HEAD")
+            rwork = git(wt, "diff")
+            if rwork:
+                rdiff = (rdiff + "\n\n# Uncommitted working-tree diff:\n" + rwork).strip()
+            if rdiff:
+                diff_chunks.append(f"# === {rname} ({r['branch']}) ===\n{rdiff}")
+            rlog = git(wt, "log", "--stat", "--format=%h %s", f"{rbase}..HEAD")
+            if rlog:
+                commit_chunks.append(f"[{rname}]\n{rlog}")
+            changed = git(wt, "diff", "--name-only", rbase, "HEAD").splitlines()
+            status_lines = git(wt, "status", "--short").splitlines()
+            for f in sorted(set(changed + status_lines)):
+                file_list.append(f"{rname}/{f}")
+            repo_summaries.append(f"`{rname}` (`{r['branch']}`)")
+        diff = "\n\n".join(diff_chunks)
+        commits_text = "\n\n".join(commit_chunks) or "(none)"
+        files = file_list[:300]
+        scope_header = (
+            f"\nMulti-repo workspace (the ONLY place the agent may modify): {cwd} "
+            f"(workdir `{repo_ctx['name']}`, repos: {', '.join(repo_summaries)})"
+        )
+        files_heading = "\n## Changed / working-tree files"
+    elif repo_ctx:
+        base = audit_base(cwd, repo_ctx=repo_ctx)
+        diff = git(cwd, "diff", base, "HEAD")
         working_diff = git(cwd, "diff")
         if working_diff:
             diff = (diff + "\n\n# Uncommitted working-tree diff:\n" + working_diff).strip()
+        commits_text = git(cwd, "log", "--stat", "--format=%h %s", f"{base}..HEAD") or "(none)"
         changed = git(cwd, "diff", "--name-only", base, "HEAD").splitlines()
         status_lines = git(cwd, "status", "--short").splitlines()
         files = sorted(set(changed + status_lines))[:300]
@@ -1872,6 +2193,9 @@ def build_dossier(
         )
         files_heading = "\n## Changed / working-tree files"
     else:
+        base = audit_base(cwd, repo_ctx=None)
+        diff = git(cwd, "diff", base, "HEAD")
+        commits_text = git(cwd, "log", "--stat", "--format=%h %s", f"{base}..HEAD") or "(none)"
         files = sorted(
             str(p.relative_to(cwd))
             for p in cwd.rglob("*")
@@ -1907,7 +2231,7 @@ def build_dossier(
         f"\n## Agent tool calls ({len(calls)})",
         *calls,
         *subagent_lines,
-        f"\n## Commits in scope\n{git(cwd, 'log', '--stat', '--format=%h %s', f'{base}..HEAD') or '(none)'}",
+        f"\n## Commits in scope\n{commits_text}",
         f"\n## Diff in scope\n```diff\n{diff or '(no changes)'}\n```",
         files_heading,
         *(files or ["(none)"]),
@@ -2049,6 +2373,147 @@ def is_busy(task_id: str) -> bool:
 # ---------- HTTP server (webhooks + access approval pages) ----------
 
 
+def handle_report_click(method: str, query: str, post_body: bytes = b"") -> tuple[int, str]:
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    try:
+        task_id, comment_id, sig = q["t"], q.get("c", ""), q["s"]
+    except KeyError:
+        return 400, access_page("Bad link", "<p>This report link is malformed.</p>")
+
+    if not verify_report_sig(SECRET, task_id, comment_id, sig):
+        return 403, access_page("Invalid link", "<p>This report link's signature doesn't match.</p>")
+
+    report = load_report(REPORTS_DIR, task_id, comment_id)
+    if not report:
+        return 404, access_page(
+            "Report not found",
+            f'<p>No saved report found for task #{html.escape(task_id)}.</p>'
+            f'<p><a href="{BOARD.task_url(task_id)}">Back to the card</a></p>',
+        )
+
+    comments = BOARD.get_comments(task_id)
+    still_open = bool(comments and (not comment_id or comments[-1].id == comment_id))
+    card_url = BOARD.task_url(task_id)
+
+    if method == "GET":
+        return 200, render_report_page(report, card_url=card_url, still_open=still_open)
+
+    if not still_open:
+        return 409, render_report_page(report, card_url=card_url, still_open=False)
+
+    form = urllib.parse.parse_qs(post_body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    action = (form.get("action") or ["submit"])[0]
+    if action == "mark_done":
+        task = BOARD.get_task(task_id)
+        if BOARD.move_to(task, "done"):
+            BOARD.post_comment(task_id, "✅ _Moved to Done._")
+            flash = "Card moved to Done."
+        else:
+            flash = "Could not find a Done list on this board."
+        return 200, render_report_page(report, card_url=card_url, still_open=False, flash=flash)
+
+    if action == "audit":
+        task = BOARD.get_task(task_id)
+        if BOARD.move_to(task, BUCKET_AUDITING):
+            enqueue(task_id)
+            flash = "Card moved to Auditing — audit started."
+        else:
+            flash = "Could not find an Auditing list on this board."
+        return 200, render_report_page(report, card_url=card_url, still_open=False, flash=flash)
+
+    reply_text = format_qa_reply(report.get("questions") or [], form)
+    BOARD.post_user_comment(task_id, reply_text)
+    enqueue(task_id)
+    return 200, render_report_page(
+        report,
+        card_url=card_url,
+        still_open=False,
+        flash="Reply posted to Planka — agent will resume shortly.",
+    )
+
+
+STANDARD_COLUMNS = [
+    "Backlog",
+    "To-Do",
+    "Need Action",
+    "Doing",
+    "Pending",
+    "Auditing",
+    "Done",
+    "Flagged",
+]
+_BOARDS_CACHE_LOCK = threading.Lock()
+_BOARDS_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+def boards_overview(force: bool = False) -> dict:
+    """Return board-to-repo/scratch mapping and column status for the dashboard."""
+    now = time.time()
+    with _BOARDS_CACHE_LOCK:
+        if not force and _BOARDS_CACHE["data"] is not None and (now - _BOARDS_CACHE["ts"]) < 15.0:
+            return _BOARDS_CACHE["data"]
+
+    workdirs = discover_workdirs()
+    board_rows: list[dict] = []
+    board_keys: set[str] = set()
+    error: str | None = None
+    try:
+        raw_boards = BOARD.list_boards()
+    except Exception as e:
+        raw_boards = []
+        error = str(e)
+
+    std_lower = [c.lower() for c in STANDARD_COLUMNS]
+    for b in raw_boards:
+        bname = str(b.get("name") or "")
+        bkey = bname.strip().lower()
+        if bkey:
+            board_keys.add(bkey)
+        subs = workdirs.get(bkey) or []
+        if len(subs) == 1:
+            target_path = str(subs[0][1])
+        elif len(subs) > 1:
+            target_path = str(subs[0][1].parent)
+        else:
+            target_path = str(TASKS_ROOT)
+        cols = [str(c) for c in (b.get("columns") or [])]
+        cols_lower = {c.lower() for c in cols}
+        missing = [c for c, cl in zip(STANDARD_COLUMNS, std_lower) if cl not in cols_lower]
+        board_rows.append(
+            {
+                "id": str(b.get("id") or ""),
+                "name": bname,
+                "url": str(b.get("url") or ""),
+                "mode": WORKTREE_LABEL if subs else SCRATCH_LABEL,
+                "repo_name": bkey if subs else None,
+                "repos": [n for n, _ in subs],
+                "target_path": target_path,
+                "columns": cols,
+                "missing_columns": missing,
+                "card_count": int(b.get("card_count") or 0),
+            }
+        )
+
+    unlinked = []
+    for wname, subs in sorted(workdirs.items()):
+        if wname not in board_keys:
+            wpath = str(subs[0][1]) if len(subs) == 1 else str(subs[0][1].parent)
+            unlinked.append({"name": wname, "path": wpath, "repos": [n for n, _ in subs]})
+    result = {
+        "boards": board_rows,
+        "unlinked_repos": unlinked,
+        "repos_root": str(REPOS_ROOT),
+        "tasks_root": str(TASKS_ROOT),
+        "standard_columns": STANDARD_COLUMNS,
+        "error": error,
+    }
+    if error is None:
+        with _BOARDS_CACHE_LOCK:
+            _BOARDS_CACHE["ts"] = now
+            _BOARDS_CACHE["data"] = result
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send_html(self, status: int, page: str):
         data = page.encode()
@@ -2079,27 +2544,127 @@ class Handler(BaseHTTPRequestHandler):
             status, page = 500, access_page("Error", f"<p>{html.escape(str(e))}</p>")
         self._send_html(status, page)
 
+    def _report(self, method: str):
+        post_body = b""
+        if method == "POST":
+            post_body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        try:
+            status, page = handle_report_click(method, urllib.parse.urlsplit(self.path).query, post_body)
+        except Exception as e:
+            log.exception("report page failed")
+            status, page = 500, access_page("Error", f"<p>{html.escape(str(e))}</p>")
+        self._send_html(status, page)
+
+    def _send_json(self, status: int, data: dict):
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        if path == "/" or path == "/ui":
+            return self._send_html(200, DASHBOARD_HTML)
         if self.path.startswith("/access?"):
             return self._access("GET")
         if self.path.startswith("/setup?"):
             return self._setup("GET")
-        if self.path == "/health":
-            payload = json.dumps({"ok": True, "board": BOARD.name, "agent": AGENT.name}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
+        if self.path.startswith("/report?"):
+            return self._report("GET")
+        if path == "/health":
+            return self._send_json(200, {"ok": True, "board": BOARD.name, "agent": AGENT.name})
+        if path == "/api/status":
+            qs = urllib.parse.parse_qs(parsed.query)
+            force_boards = (qs.get("force") or ["0"])[0] == "1"
+            settings = read_editable_settings(ENV_FILE_PATH, ENV)
+            return self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "board": BOARD.name,
+                    "agent": AGENT.name,
+                    "trigger_label": TRIGGER_LABEL,
+                    "max_concurrent": MAX_CONCURRENT,
+                    "run_timeout": RUN_TIMEOUT,
+                    "shutting_down": SHUTDOWN.is_set(),
+                    "uptime_sec": max(0, int(time.time() - START_TIME)),
+                    "active_jobs": active_jobs(),
+                    "repos": sorted(discover_repos()),
+                    "boards_overview": boards_overview(force=force_boards),
+                    "planka_url": ENV.get("PLANKA_URL", "http://localhost:3000"),
+                    "env_path": str(ENV_FILE_PATH),
+                    "settings": settings,
+                    "pricing": get_pricing_overview(ENV, settings),
+                    "recent_logs": list_recent_logs(LOGS_DIR),
+                },
+            )
+        if path == "/api/models":
+            qs = urllib.parse.parse_qs(parsed.query)
+            q = (qs.get("q") or [""])[0]
+            try:
+                limit = max(1, min(2000, int((qs.get("limit") or ["2000"])[0])))
+            except ValueError:
+                limit = 2000
+            return self._send_json(
+                200,
+                {
+                    "models": list_pricing_models(ENV, query=q, limit=limit),
+                    "agy_models": list_agy_models(ENV),
+                },
+            )
+        if path == "/api/logs":
+            qs = urllib.parse.parse_qs(parsed.query)
+            sid = (qs.get("id") or [""])[0]
+            try:
+                tail = int((qs.get("tail") or ["200"])[0])
+            except ValueError:
+                tail = 200
+            try:
+                return self._send_json(200, read_log_tail(LOGS_DIR, sid, tail=tail))
+            except FileNotFoundError as e:
+                return self._send_json(404, {"error": str(e)})
+            except ValueError as e:
+                return self._send_json(400, {"error": str(e)})
         self.send_response(404)
         self.end_headers()
 
     def do_POST(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
         if self.path.startswith("/access?"):
             return self._access("POST")
         if self.path.startswith("/setup?"):
             return self._setup("POST")
+        if self.path.startswith("/report?"):
+            return self._report("POST")
+        if path == "/api/settings":
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            try:
+                data = json.loads(body.decode("utf-8"))
+                raw_settings = data.get("settings") if isinstance(data, dict) else None
+                if not isinstance(raw_settings, dict):
+                    raise ValueError("Expected JSON object with 'settings'")
+                updated = update_env_file(ENV_FILE_PATH, raw_settings)
+                ENV.update(updated)
+                restarted = False
+                if data.get("restart"):
+                    request_service_action("restart")
+                    restarted = True
+                return self._send_json(200, {"ok": True, "updated": updated, "restarting": restarted})
+            except Exception as e:
+                return self._send_json(400, {"error": str(e)})
+        if path == "/api/service":
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            try:
+                data = json.loads(body.decode("utf-8"))
+                action = str((data or {}).get("action") or "").strip().lower()
+                msg = request_service_action(action)
+                return self._send_json(200, {"ok": True, "message": msg})
+            except Exception as e:
+                return self._send_json(400, {"error": str(e)})
         body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
         headers_lower = {k.lower(): v for k, v in self.headers.items()}
         try:
@@ -2225,6 +2790,9 @@ def force_stop() -> None:
 def watched_sources() -> list[Path]:
     root = Path(__file__).resolve().parent
     files = [Path(__file__).resolve()]
+    ui_py = root / "ui.py"
+    if ui_py.is_file():
+        files.append(ui_py)
     providers_dir = root / "providers"
     if providers_dir.is_dir():
         files.extend(sorted(providers_dir.glob("*.py")))
@@ -2273,13 +2841,14 @@ def main() -> None:
         ",".join(sorted(discover_repos())) or "none",
     )
 
-    state = {"reason": "stop", "last_signal": 0.0}
+    SHUTDOWN_STATE["reason"] = "stop"
+    SHUTDOWN_STATE["last_signal"] = 0.0
 
     def on_signal(signum, frame):
         now = time.time()
-        if now - state["last_signal"] < 1.5:
+        if now - SHUTDOWN_STATE["last_signal"] < 1.5:
             return  # one Ctrl-C can arrive twice (terminal + uv forwarding it)
-        state["last_signal"] = now
+        SHUTDOWN_STATE["last_signal"] = now
         if not SHUTDOWN.is_set():
             SHUTDOWN.set()
             jobs = active_jobs()
@@ -2321,7 +2890,7 @@ def main() -> None:
         if bad:
             continue
 
-        state["reason"] = "reload"
+        SHUTDOWN_STATE["reason"] = "reload"
         SHUTDOWN.set()
         jobs = active_jobs()
         log.info(
@@ -2333,8 +2902,8 @@ def main() -> None:
     server.shutdown()
     if proxy:
         proxy.shutdown()
-    log.info("bridge stopped (%s)", state["reason"])
-    sys.exit(EXIT_RELOAD if state["reason"] == "reload" else 0)
+    log.info("bridge stopped (%s)", SHUTDOWN_STATE["reason"])
+    sys.exit(EXIT_RELOAD if SHUTDOWN_STATE["reason"] == "reload" else 0)
 
 
 if __name__ == "__main__":
