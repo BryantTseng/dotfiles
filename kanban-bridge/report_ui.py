@@ -413,7 +413,12 @@ def render_report_page(
     if git_footer:
         meta_bits.append(f'<span class="pill">{html.escape(git_footer)}</span>')
 
-    flash_html = f'<div class="flash">{html.escape(flash)}</div>' if flash else ""
+    flash_html = f'<div class="flash">{html.escape(flash)} You can close this tab.</div>' if flash else ""
+    close_script = (
+        "<script>setTimeout(() => { try { window.close(); } catch (_) {} }, 1500);</script>"
+        if flash
+        else ""
+    )
     body_html = markdown_to_html(raw_md)
     attachments = report.get("attachments") or []
     att_html = ""
@@ -601,5 +606,6 @@ def render_report_page(
     }} catch (_) {{ /* offline fallback: raw <pre class="mermaid"> stays visible */ }}
   }}
 </script>
+{close_script}
 </body>
 </html>"""
