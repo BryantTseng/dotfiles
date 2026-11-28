@@ -733,7 +733,7 @@ function renderModelField(field, values) {
   const opts = buildOptionsForField(field, list);
   const allowMulti = !SINGLE_MODEL_FIELDS.has(field);
 
-  stack.innerHTML = list.map((val, idx) => {
+  const html = list.map((val, idx) => {
     const optHtml = ['<option value="">(unset / default)</option>']
       .concat(opts.map(o => `<option value="${escapeHtml(o.val)}"${o.val === val ? " selected" : ""}>${escapeHtml(o.label)}</option>`))
       .join("");
@@ -745,6 +745,10 @@ function renderModelField(field, values) {
       ${rmBtn}
     </div>`;
   }).join("");
+  if (stack.dataset.rendered !== html) {
+    stack.dataset.rendered = html;
+    stack.innerHTML = html;
+  }
   updateLivePrices(field);
 }
 
