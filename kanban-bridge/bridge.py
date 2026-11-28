@@ -2107,10 +2107,29 @@ def run_task(
             BOARD.complete_checklists(task_id, {"Subagents & Tasks"})
         except Exception:
             log.warning("task %s: completing Subagents & Tasks checklist failed", task_id, exc_info=True)
-        # Never auto-move to Done: park in Pending for user review/deployment/manual close.
-        if not BOARD.move_to(task, BUCKET_PENDING):
+        try:
+            open_items = BOARD.open_checklist_items(task_id)
+        except Exception:
+            log.warning("task %s: reading checklist items failed", task_id, exc_info=True)
+            open_items = []
+        if open_items:
+            listing = "\n".join(f"- [ ] {name}" for name in open_items)
+            BOARD.post_comment(
+                task_id,
+                f"⏸️ Not moving to Pending: {len(open_items)} checklist item(s) still open:\n"
+                f"{listing}\n\nFinish them (or check them off) and comment to resume.",
+            )
             BOARD.move_to(task, BUCKET_NEEDS_ACTION)
-        notify(task, f"✅ {AGENT.name} ready in Pending", first_paragraph(reply))
+            notify(
+                task,
+                f"⏸️ {AGENT.name} reported DONE with {len(open_items)} open checklist item(s)",
+                first_paragraph(reply),
+            )
+        else:
+            # Never auto-move to Done: park in Pending for user review/deployment/manual close.
+            if not BOARD.move_to(task, BUCKET_PENDING):
+                BOARD.move_to(task, BUCKET_NEEDS_ACTION)
+            notify(task, f"✅ {AGENT.name} ready in Pending", first_paragraph(reply))
     else:
         BOARD.move_to(task, BUCKET_NEEDS_ACTION)
         if requested:

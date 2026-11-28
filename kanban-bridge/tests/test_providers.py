@@ -684,6 +684,27 @@ class TestPlankaSessionTagCompat(unittest.TestCase):
             ],
         )
 
+    def test_planka_open_checklist_items(self):
+        from providers.planka import PlankaBoard
+
+        board = PlankaBoard(
+            base_url="http://localhost:3000",
+            api_key="admin-key",
+            webhook_url="http://127.0.0.1:8787/planka",
+            webhook_secret="sec",
+            bot_api_key="bot-key",
+            bot_username="agy",
+        )
+        board._api = lambda method, path, payload=None, *, api_key=None: {  # type: ignore[method-assign]
+            "included": {
+                "tasks": [
+                    {"id": "t1", "name": "Done item", "isCompleted": True},
+                    {"id": "t2", "name": " Open item ", "isCompleted": False},
+                ]
+            }
+        }
+        self.assertEqual(board.open_checklist_items("c1"), ["Open item"])
+
     def test_planka_upload_attachment_url_and_headers(self):
         import io
         from unittest import mock

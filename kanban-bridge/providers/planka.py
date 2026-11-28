@@ -576,6 +576,15 @@ class PlankaBoard(BoardProvider):
                 )["item"]
                 by_norm[name.lower()] = created
 
+    def open_checklist_items(self, task_id: str) -> list[str]:
+        data = self._api("GET", f"/cards/{task_id}") or {}
+        tasks = (data.get("included") or {}).get("tasks") or []
+        return [
+            (t.get("name") or "").strip()
+            for t in tasks
+            if not t.get("isCompleted")
+        ]
+
     def complete_checklists(
         self, task_id: str, list_names: set[str] | None = None
     ) -> int:

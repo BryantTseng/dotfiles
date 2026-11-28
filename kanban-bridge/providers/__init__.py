@@ -527,6 +527,10 @@ class BoardProvider(ABC):
         """Mark incomplete items completed in matching checklists (or all checklists if None)."""
         return 0
 
+    def open_checklist_items(self, task_id: str) -> list[str]:
+        """Names of checklist items on `task_id` that are still incomplete."""
+        return []
+
     def sync_attachments_in(
         self, task_id: str, dest_dir: Path, max_bytes: int = 25 * 1024 * 1024
     ) -> list[Attachment]:
