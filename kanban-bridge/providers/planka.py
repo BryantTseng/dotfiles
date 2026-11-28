@@ -5,7 +5,7 @@ PostgreSQL persistence, native Markdown comments, and outbound webhooks).
 
 Design choices tailored for Planka:
 - Uses `X-Api-Key` authentication (separate optional `PLANKA_BOT_API_KEY` for a dedicated
-  `viewer` + `canComment=true` bot user, falling back to a `🤖 Agy` prefix if omitted).
+  `viewer` + `canComment=true` bot user, falling back to a `🤖 Bridge` prefix if omitted).
 - Stores `session:<uuid>` as an invisible Markdown HTML comment (`<!-- agy-session:<uuid> -->`)
   at the end of the card description so Planka's board label picker stays uncluttered with only
   status/access labels (`agy`, `audited`, `audit:*`, `access:*`).
@@ -105,8 +105,8 @@ class PlankaBoard(BoardProvider):
         webhook_secret: str,
         webhook_url: str,
         bot_api_key: str | None = None,
-        bot_username: str = "agy",
-        bot_marker: str = "🤖 Agy",
+        bot_username: str = "bridge",
+        bot_marker: str = "🤖 Bridge",
         reconcile_interval: int = 60,
     ):
         self.base_url = base_url.rstrip("/")
@@ -123,7 +123,7 @@ class PlankaBoard(BoardProvider):
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "PlankaBoard":
         port = int(env.get("BRIDGE_PORT", "8787"))
-        bot_user = env.get("BOT_USERNAME", "agy")
+        bot_user = env.get("BOT_USERNAME", "bridge")
         return cls(
             base_url=env.get("PLANKA_URL", "http://localhost:3000"),
             api_key=env["PLANKA_API_KEY"],

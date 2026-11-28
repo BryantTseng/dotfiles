@@ -720,8 +720,11 @@ def system_prompt(
             "- Wait for the user to answer or reply `do it` / `proceed` before implementing.\n"
             "- End this turn with `STATUS: NEEDS_INPUT`.\n"
             "- If there is nothing to plan or implement (the request is already satisfied or needs no change), "
-            "end this turn with `STATUS: DONE` instead. Before reporting DONE, check the card's checklist "
-            "(subtasks) and make sure no items remain open; if any do, report NEEDS_INPUT and list them."
+            "end this turn with `STATUS: DONE` instead. Before reporting DONE, review every open item on the "
+            "card's checklist (subtasks): verify each one yourself (e.g. merged PR, deployed stack, passing "
+            "tests) and, if it is complete, re-send it as a `CHECKLIST:` block with `- [x]` using the exact same "
+            "name. Only items that genuinely need a human decision or a manual step you cannot do should stay "
+            "open; if any do, report NEEDS_INPUT and list just those."
         )
 
     if orchestrator:
