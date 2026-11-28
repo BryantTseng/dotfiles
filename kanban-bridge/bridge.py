@@ -718,7 +718,10 @@ def system_prompt(
             "   - Alternative option\n"
             "(Add `[multi]` on a question for multi-select, or omit options for free-text input.)\n"
             "- Wait for the user to answer or reply `do it` / `proceed` before implementing.\n"
-            "- End this turn with `STATUS: NEEDS_INPUT`."
+            "- End this turn with `STATUS: NEEDS_INPUT`.\n"
+            "- If there is nothing to plan or implement (the request is already satisfied or needs no change), "
+            "end this turn with `STATUS: DONE` instead. Before reporting DONE, check the card's checklist "
+            "(subtasks) and make sure no items remain open; if any do, report NEEDS_INPUT and list them."
         )
 
     if orchestrator:
@@ -1940,7 +1943,7 @@ def run_task(
                         log.warning("task %s: attaching model label %s failed", task_id, model_lbl, exc_info=True)
 
             reply, status = split_status(result.text)
-            if plan_only:
+            if plan_only and status != "DONE":
                 status = "NEEDS_INPUT"
             if result.is_error:
                 status = "NEEDS_INPUT"
